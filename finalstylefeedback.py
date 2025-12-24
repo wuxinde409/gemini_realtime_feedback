@@ -11,20 +11,25 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler
-from dotenv import load_dotenv # 匯入 load_dotenv
+from dotenv import load_dotenv
 
-# --- 設定 ---
+#設定 
 FOLDER_PATH = "./processed_users1/"  # 歷史資料資料夾 (用於訓練 RF)
 MONITOR_FOLDER = "./10sec/"          # 監控資料夾 (即時數據)
 QUICK_VOICE_FOLDER = "./quick_voice/" # 語音檔案資料夾
-
-load_dotenv() 
-
-# 2. 從環境變數中讀取 Key
-openai.api_key = os.getenv("OPENAI_API_KEY")
+load_dotenv("./.env",override=True)
+openai.api_key= os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    print("未輸入openAPIkey")
+else:
+    print("已取得apikey")
+boxing_df = pd.DataFrame()
 STYLE_WEIGHT_MAP = {} 
 PREVIOUS_DATA = None
 CURRENT_USER_STYLE = None # 預設風格
+FILE_PROCESS_COUNT = 0  # [新增] 計算處理過的檔案數量
+MAX_FILES_BEFORE_RESET = 6
+stop_monitoring = False
 
 # 特徵對應語音檔名的表
 FEATURE_AUDIO_MAP = {
@@ -60,15 +65,39 @@ def get_ranges(logs):
     }
 #計算即時回饋的參數
 def extract_features_for_rf(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError, Exception) as e:
+        print(f"讀取檔案錯誤: {file_path}, 原因: {e}")
+        return None
 
     summary = data.get('summary', {})
+    
+    min_rt = summary.get('minReactionTime', 0)
+    avg_rt = summary.get('avgReactionTime', 0)
+    if min_rt == 3.5835 or avg_rt == 3.5835:
+        print(f"過濾異常檔案 (ReactionTime 異常): {os.path.basename(file_path)}")
+        return None
+
+    # 取得其他數據
+    punch_power = data.get("punchPower", [])
+    max_power = max(punch_power) if punch_power else 0
+    max_speed = summary.get('maxPunchSpeed', 0)
+    punch_num = summary.get('totalPunchNum', 1)
+    
+    #這邊可以過濾一些數值異常的檔案
+    # if not (punch_num >= 0 and 0 < max_speed <= 10 and max_power <= 1000):
+    #     print(f"過濾異常數據檔案 : {os.path.basename(file_path)}")
+    #     if not punch_num >= 0: print(" totalPunchNum < 0")
+    #     if not 0 < max_speed <= 10: print(f"maxPunchSpeed 異常: {max_speed}")
+    #     if not max_power <= 1000: print(f"maxPunchPower 異常: {max_power}")
+    #     return None
+    
     player_logs = data.get('playerPosLogs', [])
     r_hand_logs = data.get('playerRHandPosLogs', [])
     l_hand_logs = data.get('playerLHandPosLogs', [])
     
-    punch_num = summary.get('totalPunchNum', 1)
     if punch_num == 0: punch_num = 1
 
     body_dist = calculate_path_length(player_logs)
@@ -80,9 +109,9 @@ def extract_features_for_rf(file_path):
 
     features = {
         'score': summary.get('score', 0),
-        'maxPunchPower': summary.get('maxPunchPower', 0),
-        'maxPunchSpeed': summary.get('maxPunchSpeed', 0),
-        'minReactionTime': summary.get('minReactionTime', 0),
+        'maxPunchPower': max_power,
+        'maxPunchSpeed': max_speed,
+        'minReactionTime': min_rt,
         'hitRate': summary.get('hitRate', 0),
         'totalPunchNum': punch_num,
         'total_user_body_movement': body_dist,
@@ -105,11 +134,14 @@ def load_all_json_files():
         if os.path.getsize(file_path) > 0:
             try:
                 feats = extract_features_for_rf(file_path)
-                data_list.append(feats)
-            except Exception:
+                if feats is not None:
+                    data_list.append(feats)
+            except Exception as e:
+                print(f"處理檔案發生未預期錯誤 {filename}: {e}")
                 continue
                 
     boxing_df = pd.DataFrame(data_list)
+    print(f"boxinfdf={boxing_df}")
     print("歷史資料載入完成")
 
 #訓練RF 模型，並將每個風格特質拳種 score拳種紀錄起來
@@ -132,7 +164,7 @@ def init_style_weights(all_data):
     for target in targets:
         STYLE_WEIGHT_MAP[target] = {"training": [], "scoring": []}
 
-        # A. 練功權重
+        # style權重
         other_summary_cols = [col for col in base_summary_cols if col != target]
         feature_cols_A = formative_cols + other_summary_cols
         rf_train = RandomForestRegressor(n_estimators=100, random_state=42)
@@ -140,7 +172,7 @@ def init_style_weights(all_data):
         imp_train = pd.Series(rf_train.feature_importances_, index=feature_cols_A).sort_values(ascending=False)
         STYLE_WEIGHT_MAP[target]["training"] = list(imp_train.items())
 
-        # B. 得分權重
+        # score權重
         features_for_score = formative_cols + [target, 'hitRate', 'totalPunchNum']
         rf_score = RandomForestRegressor(n_estimators=100, random_state=42)
         rf_score.fit(df[features_for_score], df['score'])
@@ -237,101 +269,213 @@ def calculate_detailed_stats_for_gpt(file_path):
     return raw_data
 
 #準備 Prompt 需要的 Normalized Features 與 Percentage Series
-def prepare_data_for_gpt(file_path):
+# def prepare_data_for_gpt(file_path):
+#     global boxing_df
+    
+#     # 計算該檔案的 Percentile (Summary Data)
+#     # 先取得 summary
+#     rf_feats = extract_features_for_rf(file_path) # 用這個拿 summary 比較快
+    
+#     max_values = boxing_df.max(numeric_only=True)
+    
+#     # 簡單計算 percentage (數值 / 最大值 * 100)
+#     percentage_series = {}
+#     json_columns = ["totalPunchNum", "maxPunchSpeed", "hitRate", "minReactionTime", "maxPunchPower"]
+    
+#     for col in json_columns:
+#         val = rf_feats.get(col, 0)
+#         max_v = max_values.get(col, 1)
+#         if max_v == 0: max_v = 1
+        
+#         # Reaction Time 越小越好，反向計算
+#         if col == "minReactionTime":
+#              pct = max(0, (1 - val/max_v) * 100) # 簡易反向
+#         else:
+#              pct = (val / max_v) * 100
+#         percentage_series[col] = round(pct, 2)
+
+#     # 計算 Normalized Features (Formative Data)
+#     raw_data = calculate_detailed_stats_for_gpt(file_path)
+#     if not raw_data: return None
+    
+#     scaler = MinMaxScaler()
+#     normalized_features = {}
+    
+#     # 定義要 normalize 的 key
+#     keys_to_norm = [
+#         "reactionTime", "punchSpeed", "punchPower",
+#         "l_xavg", "l_yavg", "l_zavg",
+#         "r_xavg", "r_yavg", "r_zavg",
+#         "total_r_stability", "total_l_stability"
+#     ]
+    
+#     for key in keys_to_norm:
+#         arr = np.array(raw_data.get(key, []))
+#         if len(arr) == 0:
+#             normalized_features[f"normalize_{key}"] = []
+#         else:
+#             # Reshape for scalar
+#             reshaped = arr.reshape(-1, 1)
+#             norm = scaler.fit_transform(reshaped).flatten()
+#             # mapping key name to user's prompt expectation
+#             if key == "reactionTime": new_key = "normalize_reactionTime"
+#             elif key == "punchSpeed": new_key = "normalize_punchspeed"
+#             elif key == "punchPower": new_key = "normalize_punchPower"
+#             elif key == "l_xavg": new_key = "normalize_lhand_xaverge"
+#             elif key == "l_yavg": new_key = "normalize_lhand_yaverge"
+#             elif key == "l_zavg": new_key = "normalize_lhand_zaverge"
+#             elif key == "r_xavg": new_key = "normalize_rhand_xaverge"
+#             elif key == "r_yavg": new_key = "normalize_rhand_yaverge"
+#             elif key == "r_zavg": new_key = "normalize_rhand_zaverge"
+#             elif key == "total_r_stability": new_key = "normalize_total_rhand_stability"
+#             elif key == "total_l_stability": new_key = "normalize_total_lhand_stability"
+#             else: new_key = key
+            
+#             normalized_features[new_key] = norm.tolist()
+
+#     # 加入 Percentage Series
+#     normalized_features["Percentage Series"] = percentage_series
+    
+#     return normalized_features
+
+def prepare_data_for_gpt(file_path): #第二種把資料分開的
     global boxing_df
     
-    # 計算該檔案的 Percentile (Summary Data)
-    # 先取得 summary
-    rf_feats = extract_features_for_rf(file_path) # 用這個拿 summary 比較快
+    # 提取基礎特徵（Summary 用）
+    rf_feats = extract_features_for_rf(file_path)
+    if rf_feats is None: return None
     
     max_values = boxing_df.max(numeric_only=True)
     
-    # 簡單計算 percentage (數值 / 最大值 * 100)
+    # 分類Summary Data百分比排名
     percentage_series = {}
     json_columns = ["totalPunchNum", "maxPunchSpeed", "hitRate", "minReactionTime", "maxPunchPower"]
-    
     for col in json_columns:
         val = rf_feats.get(col, 0)
         max_v = max_values.get(col, 1)
-        if max_v == 0: max_v = 1
-        
-        # Reaction Time 越小越好，反向計算
         if col == "minReactionTime":
-             pct = max(0, (1 - val/max_v) * 100) # 簡易反向
+             pct = max(0, (1 - val/max_v) * 100)
         else:
              pct = (val / max_v) * 100
         percentage_series[col] = round(pct, 2)
 
-    # 計算 Normalized Features (Formative Data)
+    #  分類Formative Data正規化細節 
     raw_data = calculate_detailed_stats_for_gpt(file_path)
-    if not raw_data: return None
-    
     scaler = MinMaxScaler()
-    normalized_features = {}
+    formative_normalized = {}
     
-    # 定義要 normalize 的 key
-    keys_to_norm = [
-        "reactionTime", "punchSpeed", "punchPower",
-        "l_xavg", "l_yavg", "l_zavg",
-        "r_xavg", "r_yavg", "r_zavg",
-        "total_r_stability", "total_l_stability"
-    ]
-    
-    for key in keys_to_norm:
-        arr = np.array(raw_data.get(key, []))
-        if len(arr) == 0:
-            normalized_features[f"normalize_{key}"] = []
-        else:
-            # Reshape for scalar
-            reshaped = arr.reshape(-1, 1)
-            norm = scaler.fit_transform(reshaped).flatten()
-            # mapping key name to user's prompt expectation
-            if key == "reactionTime": new_key = "normalize_reactionTime"
-            elif key == "punchSpeed": new_key = "normalize_punchspeed"
-            elif key == "punchPower": new_key = "normalize_punchPower"
-            elif key == "l_xavg": new_key = "normalize_lhand_xaverge"
-            elif key == "l_yavg": new_key = "normalize_lhand_yaverge"
-            elif key == "l_zavg": new_key = "normalize_lhand_zaverge"
-            elif key == "r_xavg": new_key = "normalize_rhand_xaverge"
-            elif key == "r_yavg": new_key = "normalize_rhand_yaverge"
-            elif key == "r_zavg": new_key = "normalize_rhand_zaverge"
-            elif key == "total_r_stability": new_key = "normalize_total_rhand_stability"
-            elif key == "total_l_stability": new_key = "normalize_total_lhand_stability"
-            else: new_key = key
-            
-            normalized_features[new_key] = norm.tolist()
-
-    # 加入 Percentage Series
-    normalized_features["Percentage Series"] = percentage_series
-    
-    return normalized_features
-#  呼叫 GPT API 判斷風格
-def ask_gpt_for_style(normalized_features):
-
-    normalized_features_serializable = {
-        key: (value.tolist() if isinstance(value, np.ndarray) else value)
-        for key, value in normalized_features.items()
+    keys_to_norm = {
+        "reactionTime": "normalize_reactionTime",
+        "punchSpeed": "normalize_punchspeed",
+        "punchPower": "normalize_punchPower",
+        "total_r_stability": "normalize_rhand_stability",
+        "total_l_stability": "normalize_lhand_stability"
     }
     
-    prompt = f"Based on the following normalized feature data and summary percentage data, please act as a professional boxing coach with expertise in analyzing boxing performance. The Percentage Series represents the percentile rank compared to all other data, indicating the percentage of performance this user has surpassed. The remaining data under formative data reflects key metrics normalized for analytical purposes. Your task is to provide: First, Among the three styles I gave you, choose one mainly based on punchspeed ,punchpower,reactiontime  which has the highest correlation in the normalized_features (Agile Rapid Striker 靈敏速功選手 (Speed), Dominant Knockout Artist, 壓迫KO藝術家 (Power),Precision Timing Specialist 精準時機掌控專家(Reaction)).  .\n{json.dumps(normalized_features_serializable, indent=2)}"
+    for key, new_key in keys_to_norm.items():
+        arr = np.array(raw_data.get(key, []))
+        if len(arr) > 0:
+            norm = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
+            formative_normalized[new_key] = norm.tolist()
+            # 額外加入平均值，幫助 GPT 快速抓到特徵
+            formative_normalized[f"{new_key}_mean"] = round(float(np.mean(norm)), 4)
+
+    # 最終傳出的結構
+    return {
+        "summary_data": percentage_series,
+        "formative_data": formative_normalized
+    }
     
-    print("正在傳送資料給 GPT 進行風格分析...")
+#  呼叫 GPT API 判斷風格
+# def ask_gpt_for_style(normalized_features):
+
+#     normalized_features_serializable = {
+#         key: (value.tolist() if isinstance(value, np.ndarray) else value)
+#         for key, value in normalized_features.items()
+#     }
+    
+#     prompt = f"""
+#     You are a strict data classifier. Do not act as a coach. Do not explain.
+#     Task: Analyze the provided normalized boxing metrics (Speed, Power, Reaction Time).
+#     1. Summary Data (Percentage Series): Overall performance compared to the dataset. HIGHER IS BETTER.
+#     2. Formative Data (Normalized Metrics): Detailed movement habits during the session. 
+#     Identify the user's dominant style based on which normalized_features's normalize_value and normalized_features's Percentage Series, make sure which boxing style is suit for the current user.
+
+#     Input Data:
+#     {json.dumps(normalized_features_serializable, indent=2)}
+
+#     Output Options (Choose EXACTLY one):
+#     1. Agile Rapid Striker 靈敏速功選手 (Speed)
+#     2. Dominant Knockout Artist 壓迫KO藝術家 (Power)
+#     3. Precision Timing Specialist 精準時機掌控專家 (Reaction)
+
+#     Constraint:
+#     - Return ONLY the style name from the options above.
+#     - NO introduction, NO reasoning, NO explanation.
+#     - Example Output: Dominant Knockout Artist 壓迫KO藝術家 (Power)
+#     """
+#     print("正在傳送資料給 GPT 進行風格分析...")
+#     try:
+#         response = openai.ChatCompletion.create(
+#             # model="gpt-4o",
+#             model="gpt-3.5-turbo-0125", 
+#             messages=[
+#                 {"role": "system", "content": "You are a Professional Boxing Coach and Professional Data Analyst"},
+#                 {"role": "user", "content": prompt}
+#             ],
+#             max_tokens=200,
+#             temperature=0.6
+#         )
+#         result = response.choices[0].message["content"].strip()
+#         print(f"GPT 回傳結果: {result}")
+#         return result
+#     except Exception as e:
+#         print(f"GPT API 呼叫錯誤: {e}")
+#         return None
+    
+
+def ask_gpt_for_style(structured_data):
+    # 強化的 Prompt，明確區分 Summary 與 Formative
+    prompt = f"""
+    You are a data analyst. Your goal is to classify a boxer's style based on two distinct data types:
+    
+    1. Summary Data (Percentage Series): Overall performance compared to the dataset. HIGHER IS BETTER.
+    2. Formative Data (Normalized Metrics): Detailed movement habits during the session.
+
+    Input Data:
+    {json.dumps(structured_data, indent=2)}
+
+    Classification Logic (Strict):
+    Priority 1: Look at 'summary_data'. The style MUST match the metric with the HIGHEST percentage rank.
+    If 'maxPunchPower' has the highest percentile (e.g., 90%), the style IS 'Dominant Knockout Artist'.
+    If 'maxPunchSpeed ' has the highest percentile (e.g., 90%), the style IS 'Agile Rapid Striker'.
+    If 'minReactionTime' has the highest percentile (e.g., 90%), the style IS 'Precision Timing Specialist'.
+    
+    Use 'formative_data' ONLY to verify the consistency of movements.
+
+    Output Options (CHOOSE ONE):
+    Agile Rapid Striker 靈敏速功選手 (Speed)
+    Dominant Knockout Artist 壓迫KO藝術家 (Power)
+    Precision Timing Specialist 精準時機掌控專家 (Reaction)
+
+    Constraint: Return ONLY the exact style name. No explanation.
+    """
+    
     try:
         response = openai.ChatCompletion.create(
-            # model="gpt-4o",
             model="gpt-3.5-turbo-0125", 
             messages=[
-                {"role": "system", "content": "You are a Professional Boxing Coach and Professional Data Analyst"},
+                {"role": "system", "content": "You are a precise classification engine."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=200,
-            temperature=0.6
+            max_tokens=100,
+            temperature=0.2
         )
         result = response.choices[0].message["content"].strip()
-        print(f"GPT 回傳結果: {result}")
+        print(f"GPT 最終風格判定: {result}")
         return result
     except Exception as e:
-        print(f"GPT API 呼叫錯誤: {e}")
+        print(f"GPT API 錯誤: {e}")
         return None
 #解析 GPT 回傳的文字，對應到系統內部的 Style Key
 def determine_style_from_gpt_result(gpt_text):
@@ -385,22 +529,23 @@ def process_feedback_with_style_logic(current_file_path):
     prev_val = PREVIOUS_DATA[CURRENT_USER_STYLE]
 
     if CURRENT_USER_STYLE == "minReactionTime":
-        # 反應時間：越短(小)越好
+        # 反應時間：越小越好
         if curr_val < prev_val: target_improved = True 
     elif CURRENT_USER_STYLE == "maxPunchSpeed":
-        # 速度：越快(大)越好
+        # 速度：越快越好
         if curr_val > prev_val: target_improved = True
     elif CURRENT_USER_STYLE == "maxPunchPower":
         # 力量：越大越好
         if curr_val > prev_val: target_improved = True
     else:
-        # (越大越好)
         if curr_val > prev_val: target_improved = True 
 
     audio_to_play = None
     reason = ""
+    feedback_mode = ""
 
     if not target_improved:
+        feedback_mode = "Style"
         print(f"風格 {CURRENT_USER_STYLE}沒有提升, 與之前的差異 ({prev_val:.2f} -> {curr_val:.2f})")
         print("尋找合適提升風格的語音")
         weights = STYLE_WEIGHT_MAP[CURRENT_USER_STYLE]["training"]
@@ -424,6 +569,7 @@ def process_feedback_with_style_logic(current_file_path):
                     reason = f"{feature} 下降 (權重 {weight:.4f})"
                     break # 找到權重最高且變差的特徵，跳出迴圈
     else:
+        feedback_mode = "Score"
         print(f"{CURRENT_USER_STYLE} 提升了非常多 ({prev_val:.2f} -> {curr_val:.2f})")
         print("尋找合適提升score的語音")
         weights = STYLE_WEIGHT_MAP[CURRENT_USER_STYLE]["scoring"]
@@ -441,7 +587,7 @@ def process_feedback_with_style_logic(current_file_path):
                     break
 
     if audio_to_play:
-            play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE, audio_to_play)
+            play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE,feedback_mode, audio_to_play)
             
             print(f"[播放] 語音: {audio_to_play} | 原因: {reason}")
             print(f"路徑: {play_path}") # Debug
@@ -472,7 +618,7 @@ DELAY_SEC = 4
 
 class JsonHandler(FileSystemEventHandler):
     def on_created(self, event):
-        global LAST_TRIGGER_TIME
+        global LAST_TRIGGER_TIME, FILE_PROCESS_COUNT, stop_monitoring
         now = time.time()
         
         if now - LAST_TRIGGER_TIME < DELAY_SEC:
@@ -484,67 +630,125 @@ class JsonHandler(FileSystemEventHandler):
             print(f"\n偵測到新 JSON 檔案：{event.src_path}")
             if wait_for_file_release(event.src_path):
                 process_feedback_with_style_logic(event.src_path)
+                
+                # [新增] 計數與重置邏輯
+                FILE_PROCESS_COUNT += 1
+                print(f"目前已處理 {FILE_PROCESS_COUNT}/{MAX_FILES_BEFORE_RESET} 個檔案")
+                
+                if FILE_PROCESS_COUNT >= MAX_FILES_BEFORE_RESET:
+                    print("\n>>> 已達 6 次一個round，換下一個新的user體驗")
+                    stop_monitoring = True # 通知主迴圈停止
+                    
             else:
                 print(f"無法讀取：{event.src_path}")
-
-# 主程式 
 if __name__ == "__main__":
-    # 1載入歷史資料並初始化 RF
-    load_all_json_files() 
-    if not boxing_df.empty:
-        training_data = boxing_df.to_dict('records')
-        init_style_weights(training_data)
-    else:
-        print("警告：沒有歷史資料，無法建立權重系統。")
-
-    # 2選擇基準檔案以定義風格
-    files = [f for f in os.listdir(FOLDER_PATH) if f.endswith(".json")]
-    if not files:
-        print("無檔案可選，程式結束")
-        exit()
-        
-    print("\n--- 請選擇一個檔案作為風格定義基準 ---")
-    for i, f in enumerate(files):
-        print(f"{i}: {f}")
     
-    try:
-        idx = int(input("請輸入檔案編號: "))
-        selected_file = os.path.join(FOLDER_PATH, files[idx])
-        print("正在建立user上一次基準數據...")
-        PREVIOUS_DATA = extract_features_for_rf(selected_file)
-        print(f"基準數據已建立 (Score: {PREVIOUS_DATA['score']})")
-        #3準備資料給 GPT 並取得分析結果
-        gpt_features = prepare_data_for_gpt(selected_file)
-        if gpt_features:
-            gpt_result_text = ask_gpt_for_style(gpt_features)
-            
-            # 4解析 GPT 結果並設定 CURRENT_USER_STYLE
-            CURRENT_USER_STYLE = determine_style_from_gpt_result(gpt_result_text)
-            print(f"\n拳擊風格為: {CURRENT_USER_STYLE} <<<\n")
+    while True:
+        # 重置計數器與
+        FILE_PROCESS_COUNT = 0
+        stop_monitoring = False 
+        
+        print("\n正在重新載入最新資料庫")
+        # 1. 將載入與訓練移入迴圈，確保讀取到新檔案
+        load_all_json_files() 
+        if not boxing_df.empty:
+            training_data = boxing_df.to_dict('records')
+            init_style_weights(training_data)
         else:
-            print("從gpt獲取的風格失敗，使用預設風格 Power")
-            CURRENT_USER_STYLE = "maxPunchPower"
-            
-    except Exception as e:
-        print(f"選擇錯誤或發生異常: {e}")
-        CURRENT_USER_STYLE = "maxPunchPower"
-        print("使用預設風格 Power")
+            print("警告：沒有過去資料，無法建立權重比較。")
 
-    # 5啟動監控
-    event_handler = JsonHandler()
-    observer = Observer()
-    
-    if not os.path.exists(MONITOR_FOLDER):
-        os.makedirs(MONITOR_FOLDER)
-        print(f"建立監控資料夾: {MONITOR_FOLDER}")
+        # 2. 選擇基準檔案 (加入排序與檔名支援)
+        files = [f for f in os.listdir(FOLDER_PATH) if f.endswith(".json")]
+        # 依照修改時間排序，新的檔案會在最下面
+        files.sort(key=lambda f: os.path.getmtime(os.path.join(FOLDER_PATH, f)))
         
-    observer.schedule(event_handler, MONITOR_FOLDER, recursive=False)
-    print(f"Watchdog 已啟動，開始監控資料夾：{MONITOR_FOLDER}")
-    observer.start()
-    
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
+        if not files:
+            print("無檔案可選，程式結束")
+            break 
+            
+        print("\n 請選擇一個檔案作為 User 過去資料風格 (可輸入編號或完整檔名)")
+        # 顯示最後 10 筆就好，避免列表太長，或者您可以保留全部顯示
+        start_idx = max(0, len(files) - 15)
+        if start_idx > 0: print(f"... (略過前 {start_idx} 筆) ...")
+        
+        for i in range(start_idx, len(files)):
+            print(f"{i}: {files[i]}")
+        
+        selected_file = None
+        
+        # 輸入判斷迴圈，直到輸入正確為止
+        while selected_file is None:
+            user_input = input(f"\n請輸入檔案編號 (0~{len(files)-1}) 或 完整檔名 (輸入 q 離開): ").strip()
+            
+            if user_input.lower() == 'q':
+                print("程式結束")
+                exit()
+            
+            # 情況 A: 輸入的是數字 (編號)
+            if user_input.isdigit():
+                idx = int(user_input)
+                if 0 <= idx < len(files):
+                    selected_file = os.path.join(FOLDER_PATH, files[idx])
+                else:
+                    print(f"編號錯誤！請輸入 0 到 {len(files)-1} 之間的數字。")
+            
+            # 情況 B: 輸入的是檔名 (字串)
+            else:
+                # 自動補齊 .json (如果使用者沒打)
+                potential_name = user_input if user_input.endswith(".json") else user_input + ".json"
+                if potential_name in files:
+                    selected_file = os.path.join(FOLDER_PATH, potential_name)
+                else:
+                    print(f"找不到檔案：{user_input}，請檢查名稱是否正確。")
+
+        # 成功選取檔案後，繼續執行
+        try:
+            print(f"已選擇檔案：{os.path.basename(selected_file)}")
+            print("正在建立 User 上一次基準數據...")
+            PREVIOUS_DATA = extract_features_for_rf(selected_file)
+            print(f"基準數據已建立 (Score: {PREVIOUS_DATA['score']})")
+            
+            # 3. 準備資料給 GPT
+            gpt_features = prepare_data_for_gpt(selected_file)
+            if gpt_features:
+                gpt_result_text = ask_gpt_for_style(gpt_features)
+                CURRENT_USER_STYLE = determine_style_from_gpt_result(gpt_result_text)
+                print(f"\n拳擊風格為: {CURRENT_USER_STYLE} <<<\n")
+            else:
+                print("從 GPT 獲取風格失敗，使用預設風格 Power")
+                CURRENT_USER_STYLE = "maxPunchPower"
+                
+        except Exception as e:
+            print(f"發生異常: {e}")
+            CURRENT_USER_STYLE = "maxPunchPower"
+            print("使用預設風格 Power")
+
+        # 5. 啟動監控
+        event_handler = JsonHandler()
+        observer = Observer()
+        
+        if not os.path.exists(MONITOR_FOLDER):
+            os.makedirs(MONITOR_FOLDER)
+            print(f"建立監控資料夾: {MONITOR_FOLDER}")
+            
+        observer.schedule(event_handler, MONITOR_FOLDER, recursive=False)
+        print(f"開始監控資料夾：{MONITOR_FOLDER}")
+        print(f"監控中... (蒐集滿 {MAX_FILES_BEFORE_RESET} 個檔案後將重置)")
+        
+        observer.start()
+        
+        try:
+            while not stop_monitoring:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            observer.stop()
+            observer.join()
+            print("程式終止")
+            exit() # 直接結束整個程式
+            
+        # 當 stop_monitoring 變成 True，會執行到這裡
         observer.stop()
-    observer.join()
+        observer.join()
+        print("\nround結束，準備讀取下一位user \n")
+        print("等待 5 秒讓您拖入新檔案...")
+        time.sleep(5)
