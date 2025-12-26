@@ -27,7 +27,7 @@ boxing_df = pd.DataFrame()
 STYLE_WEIGHT_MAP = {} 
 PREVIOUS_DATA = None
 CURRENT_USER_STYLE = None # 預設風格
-FILE_PROCESS_COUNT = 0  # [新增] 計算處理過的檔案數量
+FILE_PROCESS_COUNT = 0  # 計算處理過的檔案數量
 MAX_FILES_BEFORE_RESET = 6
 stop_monitoring = False
 
@@ -64,6 +64,64 @@ def get_ranges(logs):
         'z_range': max(zs) - min(zs)
     }
 #計算即時回饋的參數
+# def extract_features_for_rf(file_path): #舊版
+#     try:
+#         with open(file_path, "r", encoding="utf-8") as f:
+#             data = json.load(f)
+#     except (json.JSONDecodeError, FileNotFoundError, Exception) as e:
+#         print(f"讀取檔案錯誤: {file_path}, 原因: {e}")
+#         return None
+
+#     summary = data.get('summary', {})
+    
+#     min_rt = summary.get('minReactionTime', 0)
+#     avg_rt = summary.get('avgReactionTime', 0)
+#     if min_rt == 3.5835 or avg_rt == 3.5835:
+#         print(f"過濾異常檔案 (ReactionTime 異常): {os.path.basename(file_path)}")
+#         return None
+
+#     # 取得其他數據
+#     punch_power = data.get("punchPower", [])
+#     max_power = max(punch_power) if punch_power else 0
+#     max_speed = summary.get('maxPunchSpeed', 0)
+#     punch_num = summary.get('totalPunchNum', 1)
+    
+#     #這邊可以過濾一些數值異常的檔案
+#     # if not (punch_num >= 0 and 0 < max_speed <= 10 and max_power <= 1000):
+#     #     print(f"過濾異常數據檔案 : {os.path.basename(file_path)}")
+#     #     if not punch_num >= 0: print(" totalPunchNum < 0")
+#     #     if not 0 < max_speed <= 10: print(f"maxPunchSpeed 異常: {max_speed}")
+#     #     if not max_power <= 1000: print(f"maxPunchPower 異常: {max_power}")
+#     #     return None
+    
+#     player_logs = data.get('playerPosLogs', [])
+#     r_hand_logs = data.get('playerRHandPosLogs', [])
+#     l_hand_logs = data.get('playerLHandPosLogs', [])
+    
+#     if punch_num == 0: punch_num = 1
+
+#     body_dist = calculate_path_length(player_logs)
+#     r_dist = calculate_path_length(r_hand_logs)
+#     l_dist = calculate_path_length(l_hand_logs)
+#     total_move_per = (r_dist + l_dist) / punch_num
+    
+#     rng = get_ranges(player_logs)
+
+#     features = {
+#         'score': summary.get('score', 0),
+#         'maxPunchPower': max_power,
+#         'maxPunchSpeed': max_speed,
+#         'minReactionTime': min_rt,
+#         'hitRate': summary.get('hitRate', 0),
+#         'totalPunchNum': punch_num,
+#         'total_user_body_movement': body_dist,
+#         'total_hand_move_per_punch': total_move_per,
+#         'range_x': rng['x_range'],
+#         'range_y': rng['y_range'],
+#         'range_z': rng['z_range']
+#     }
+#     return features
+
 def extract_features_for_rf(file_path):
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -72,56 +130,51 @@ def extract_features_for_rf(file_path):
         print(f"讀取檔案錯誤: {file_path}, 原因: {e}")
         return None
 
+    # (從 Summary 讀取，確保與 test3.py 一致)
     summary = data.get('summary', {})
     
+    # 保留原本的過濾，防止異常數據影響權重
     min_rt = summary.get('minReactionTime', 0)
     avg_rt = summary.get('avgReactionTime', 0)
     if min_rt == 3.5835 or avg_rt == 3.5835:
-        print(f"過濾異常檔案 (ReactionTime 異常): {os.path.basename(file_path)}")
+        # print(f"過濾異常檔案 (ReactionTime 異常): {os.path.basename(file_path)}")
         return None
-
-    # 取得其他數據
     punch_power = data.get("punchPower", [])
     max_power = max(punch_power) if punch_power else 0
-    max_speed = summary.get('maxPunchSpeed', 0)
+    score = summary.get('score', 0)
     punch_num = summary.get('totalPunchNum', 1)
-    
-    #這邊可以過濾一些數值異常的檔案
-    # if not (punch_num >= 0 and 0 < max_speed <= 10 and max_power <= 1000):
-    #     print(f"過濾異常數據檔案 : {os.path.basename(file_path)}")
-    #     if not punch_num >= 0: print(" totalPunchNum < 0")
-    #     if not 0 < max_speed <= 10: print(f"maxPunchSpeed 異常: {max_speed}")
-    #     if not max_power <= 1000: print(f"maxPunchPower 異常: {max_power}")
-    #     return None
+    if punch_num == 0: punch_num = 1
     
     player_logs = data.get('playerPosLogs', [])
     r_hand_logs = data.get('playerRHandPosLogs', [])
     l_hand_logs = data.get('playerLHandPosLogs', [])
     
-    if punch_num == 0: punch_num = 1
-
     body_dist = calculate_path_length(player_logs)
     r_dist = calculate_path_length(r_hand_logs)
     l_dist = calculate_path_length(l_hand_logs)
     total_move_per = (r_dist + l_dist) / punch_num
     
+    # 計算範圍 
     rng = get_ranges(player_logs)
-
+    
     features = {
-        'score': summary.get('score', 0),
+        'score': score,
+        # 直接使用 Summary 的數值，而非自己用 list 算 max，確保與 test3 一致
         'maxPunchPower': max_power,
-        'maxPunchSpeed': max_speed,
-        'minReactionTime': min_rt,
+        'maxPunchSpeed': summary.get('maxPunchSpeed', 0),
+        'minReactionTime': summary.get('minReactionTime', 0),
         'hitRate': summary.get('hitRate', 0),
-        'totalPunchNum': punch_num,
+        
+        # 新特徵 (Formative)
         'total_user_body_movement': body_dist,
-        'total_hand_move_per_punch': total_move_per,
+        'total_hand_move_per_punch': total_move_per, 
+        'totalPunchNum': punch_num,
         'range_x': rng['x_range'],
         'range_y': rng['y_range'],
         'range_z': rng['z_range']
     }
+    
     return features
-
 # 將一開始的資料進行權重分析, 並建立boxing_df
 def load_all_json_files():
     global boxing_df
@@ -144,7 +197,43 @@ def load_all_json_files():
     print(f"boxinfdf={boxing_df}")
     print("歷史資料載入完成")
 
-#訓練RF 模型，並將每個風格特質拳種 score拳種紀錄起來
+
+# def init_style_weights(all_data): #訓練RF 模型，並將每個風格特質拳種 score拳種紀錄起來, 舊版
+#     global STYLE_WEIGHT_MAP
+#     if not all_data: return
+
+#     df = pd.DataFrame(all_data)
+#     df = df.dropna()
+
+#     formative_cols = [
+#         'total_user_body_movement', 'total_hand_move_per_punch', 
+#         'range_x', 'range_y', 'range_z'
+#     ]
+#     base_summary_cols = ['maxPunchPower', 'maxPunchSpeed', 'minReactionTime', 'hitRate']
+#     targets = ["maxPunchPower", "maxPunchSpeed", "minReactionTime"]
+
+#     print("正在初始化風格權重系統...")
+
+#     for target in targets:
+#         STYLE_WEIGHT_MAP[target] = {"training": [], "scoring": []}
+
+#         # style權重
+#         other_summary_cols = [col for col in base_summary_cols if col != target]
+#         feature_cols_A = formative_cols + other_summary_cols
+#         rf_train = RandomForestRegressor(n_estimators=100, random_state=42)
+#         rf_train.fit(df[feature_cols_A], df[target])
+#         imp_train = pd.Series(rf_train.feature_importances_, index=feature_cols_A).sort_values(ascending=False)
+#         STYLE_WEIGHT_MAP[target]["training"] = list(imp_train.items())
+
+#         # score權重
+#         features_for_score = formative_cols + [target, 'hitRate', 'totalPunchNum']
+#         rf_score = RandomForestRegressor(n_estimators=100, random_state=42)
+#         rf_score.fit(df[features_for_score], df['score'])
+#         imp_score = pd.Series(rf_score.feature_importances_, index=features_for_score).sort_values(ascending=False)
+#         STYLE_WEIGHT_MAP[target]["scoring"] = list(imp_score.items())
+        
+#         print(f"{target}style處理完成{STYLE_WEIGHT_MAP[target]["training"]}")
+#         print(f"{target}style的score權重處理完成{STYLE_WEIGHT_MAP[target]["scoring"]}")
 def init_style_weights(all_data):
     global STYLE_WEIGHT_MAP
     if not all_data: return
@@ -164,23 +253,33 @@ def init_style_weights(all_data):
     for target in targets:
         STYLE_WEIGHT_MAP[target] = {"training": [], "scoring": []}
 
-        # style權重
+        # style
         other_summary_cols = [col for col in base_summary_cols if col != target]
+        if target == "maxPunchSpeed" and "maxPunchPower" in other_summary_cols:
+            other_summary_cols.remove("maxPunchPower")
+
         feature_cols_A = formative_cols + other_summary_cols
         rf_train = RandomForestRegressor(n_estimators=100, random_state=42)
         rf_train.fit(df[feature_cols_A], df[target])
         imp_train = pd.Series(rf_train.feature_importances_, index=feature_cols_A).sort_values(ascending=False)
         STYLE_WEIGHT_MAP[target]["training"] = list(imp_train.items())
 
-        # score權重
+        # Scoring
         features_for_score = formative_cols + [target, 'hitRate', 'totalPunchNum']
         rf_score = RandomForestRegressor(n_estimators=100, random_state=42)
         rf_score.fit(df[features_for_score], df['score'])
         imp_score = pd.Series(rf_score.feature_importances_, index=features_for_score).sort_values(ascending=False)
         STYLE_WEIGHT_MAP[target]["scoring"] = list(imp_score.items())
         
-        print(f"{target}style處理完成{STYLE_WEIGHT_MAP[target]["training"]}")
-        print(f"{target}style的score權重處理完成{STYLE_WEIGHT_MAP[target]["scoring"]}")
+        print(f"\n當前分析風格: {target}") #找出權重分析
+        print(f"想提升 {target}，應該專注在:")
+        for name, val in STYLE_WEIGHT_MAP[target]["training"][:5]: # 只印前5名
+            print(f"{name:<30} (權重: {val:.4f})")
+            
+        print(f"在 {target} 的風格中，影響 Score 的是:")
+        for name, val in STYLE_WEIGHT_MAP[target]["scoring"][:5]: # 只印前5名
+            print(f"{name:<30} (權重: {val:.4f})")
+
 # 送資料及正規劃給gpt
 def calculate_detailed_stats_for_gpt(file_path):
     
@@ -463,7 +562,8 @@ def ask_gpt_for_style(structured_data):
     
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo-0125", 
+            # model="gpt-3.5-turbo-0125", 
+            model="chatgpt-4o-latest",
             messages=[
                 {"role": "system", "content": "You are a precise classification engine."},
                 {"role": "user", "content": prompt}
@@ -493,17 +593,30 @@ def determine_style_from_gpt_result(gpt_text):
         print("無法從 GPT 回覆中解析出明確風格，使用預設值 Power")
         return "maxPunchPower"
 
-# 音效播放
+
+pygame.mixer.init()# 在全域先初始化就好
+
 def play_quick_voice(file_path):
     try:
-        if pygame.mixer.get_init():
+        if pygame.mixer.music.get_busy(): # 停止舊音樂，載入新音樂即可，不要再 init 了
             pygame.mixer.music.stop()
-        pygame.mixer.init()
+            
         pygame.mixer.music.load(file_path)
         pygame.mixer.music.play()
         print(f"播放中：{os.path.basename(file_path)}")
     except Exception as e:
         print(f"播放快速語音時發生錯誤：{e}")
+
+# def play_quick_voice(file_path):# 音效播放
+#     try:
+#         if pygame.mixer.get_init():
+#             pygame.mixer.music.stop()
+#         pygame.mixer.init()
+#         pygame.mixer.music.load(file_path)
+#         pygame.mixer.music.play()
+#         print(f"播放中：{os.path.basename(file_path)}")
+#     except Exception as e:
+#         print(f"播放快速語音時發生錯誤：{e}")
 
 # 核心回饋邏輯 
 LOWER_IS_BETTER_FEATURES = ["minReactionTime"]
@@ -554,7 +667,7 @@ def process_feedback_with_style_logic(current_file_path):
             curr_feat_val = current_data.get(feature, 0)
             prev_feat_val = PREVIOUS_DATA.get(feature, 0)
 
-            # [修正點] 通用化判斷邏輯：根據特徵性質決定比較方向
+            # 通用化判斷邏輯：根據特徵性質決定比較方向
             if feature in LOWER_IS_BETTER_FEATURES:
                 # 越小越好，如果變大就是變差
                 if curr_feat_val > prev_feat_val: is_worse = True
@@ -642,7 +755,15 @@ class JsonHandler(FileSystemEventHandler):
             else:
                 print(f"無法讀取：{event.src_path}")
 if __name__ == "__main__":
-    
+    print("\n開始處理原先資料庫並分配權重")
+    load_all_json_files() 
+    if not boxing_df.empty:
+        training_data = boxing_df.to_dict('records')
+        init_style_weights(training_data)
+    else:
+        print("沒有過去資料，無法建立權重比較。")
+    if not pygame.mixer.get_init():
+            pygame.mixer.init()
     while True:
         # 重置計數器與
         FILE_PROCESS_COUNT = 0
@@ -650,12 +771,11 @@ if __name__ == "__main__":
         
         print("\n正在重新載入最新資料庫")
         # 1. 將載入與訓練移入迴圈，確保讀取到新檔案
-        load_all_json_files() 
-        if not boxing_df.empty:
+        load_all_json_files()
+        if not STYLE_WEIGHT_MAP and not boxing_df.empty:
+            print("檢測首次資料移失，重新建立風格權重系統.")
             training_data = boxing_df.to_dict('records')
             init_style_weights(training_data)
-        else:
-            print("警告：沒有過去資料，無法建立權重比較。")
 
         # 2. 選擇基準檔案 (加入排序與檔名支援)
         files = [f for f in os.listdir(FOLDER_PATH) if f.endswith(".json")]
