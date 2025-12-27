@@ -28,17 +28,18 @@ STYLE_WEIGHT_MAP = {}
 PREVIOUS_DATA = None
 CURRENT_USER_STYLE = None # 預設風格
 FILE_PROCESS_COUNT = 0  # 計算處理過的檔案數量
-MAX_FILES_BEFORE_RESET = 6
+MAX_FILES_BEFORE_RESET = 6  #看你幾秒一組就 30/x= MAX_FILES_BEFORE_RESET
 stop_monitoring = False
 
-# 特徵對應語音檔名的表
+# 特徵對應語音檔名的表,總共九大類
 FEATURE_AUDIO_MAP = {
     "totalPunchNum": "totalPunchNum.wav",           
     "total_user_body_movement": "total_user_body_movement.wav", 
     "minReactionTime": "minReactionTime.wav",     
     "total_hand_move_per_punch": "total_hand_move_per_punch.wav",
     "range_z": "range_z.wav",              
-    "range_x": "range_x.wav",                  
+    "range_x": "range_x.wav", 
+    "range_y": "range_y.wav",                 
     "hitRate": "hitRate.wav",                 
     "maxPunchSpeed": "maxPunchSpeed.wav",         
     "maxPunchPower": "maxPunchPower.wav"          
@@ -273,11 +274,11 @@ def init_style_weights(all_data):
         
         print(f"\n當前分析風格: {target}") #找出權重分析
         print(f"想提升 {target}，應該專注在:")
-        for name, val in STYLE_WEIGHT_MAP[target]["training"][:5]: # 只印前5名
+        for name, val in STYLE_WEIGHT_MAP[target]["training"]: # 只印前5名
             print(f"{name:<30} (權重: {val:.4f})")
             
         print(f"在 {target} 的風格中，影響 Score 的是:")
-        for name, val in STYLE_WEIGHT_MAP[target]["scoring"][:5]: # 只印前5名
+        for name, val in STYLE_WEIGHT_MAP[target]["scoring"]: # 只印前5名
             print(f"{name:<30} (權重: {val:.4f})")
 
 # 送資料及正規劃給gpt
@@ -620,6 +621,7 @@ def play_quick_voice(file_path):
 
 # 核心回饋邏輯 
 LOWER_IS_BETTER_FEATURES = ["minReactionTime"]
+
 def process_feedback_with_style_logic(current_file_path):
     global PREVIOUS_DATA, CURRENT_USER_STYLE
     
@@ -710,7 +712,15 @@ def process_feedback_with_style_logic(current_file_path):
             else:
                 print(f"找不到音檔: {play_path}")
     else:
-        print("表現優秀，所有關鍵指標都在進步 (或無對應音檔)。")
+            print(f"表現優秀！關鍵指標都在進步！")
+            best_file = "best.wav"
+            play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE, feedback_mode, best_file)
+            if os.path.exists(play_path):
+                print(f"[播放] 完美稱讚語音: {best_file}")
+                play_quick_voice(play_path)
+            else:
+                print(f"找不到完美稱讚語音: {play_path}")
+                print("請確認是否已在該風格資料夾中放入 best.wav")
 
     PREVIOUS_DATA = current_data
 
