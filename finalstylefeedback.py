@@ -30,6 +30,7 @@ CURRENT_USER_STYLE = None # 預設風格
 FILE_PROCESS_COUNT = 0  # 計算處理過的檔案數量
 MAX_FILES_BEFORE_RESET = 6  #看你幾秒一組就 30/x= MAX_FILES_BEFORE_RESET
 stop_monitoring = False
+ROUND_PUNCH_ACCUMULATOR = 0
 
 # 特徵對應語音檔名的表,總共九大類
 FEATURE_AUDIO_MAP = {
@@ -280,7 +281,7 @@ def init_style_weights(all_data):
         print(f"在 {target} 的風格中，影響 Score 的是:")
         for name, val in STYLE_WEIGHT_MAP[target]["scoring"]: # 只印前5名
             print(f"{name:<30} (權重: {val:.4f})")
-
+previousboxstyle_totalpunchnum=0
 # 送資料及正規劃給gpt
 def calculate_detailed_stats_for_gpt(file_path):
     
@@ -292,6 +293,8 @@ def calculate_detailed_stats_for_gpt(file_path):
     playerLHandPosLogs = data.get("playerLHandPosLogs", [])
     puncherIdx = data.get("puncherIdx", [])
     punchTimeCode = data.get("punchTimeCode", [])
+    summary = data.get('summary', {})
+    previousboxstyle_totalpunchnum = summary.get("totalPunchNum",0)
     reactionTime = data.get("reactionTime", [])
     punchSpeed = data.get("punchSpeed", [])
     punchPower = data.get("punchPower", [])
@@ -369,74 +372,6 @@ def calculate_detailed_stats_for_gpt(file_path):
     return raw_data
 
 #準備 Prompt 需要的 Normalized Features 與 Percentage Series
-# def prepare_data_for_gpt(file_path):
-#     global boxing_df
-    
-#     # 計算該檔案的 Percentile (Summary Data)
-#     # 先取得 summary
-#     rf_feats = extract_features_for_rf(file_path) # 用這個拿 summary 比較快
-    
-#     max_values = boxing_df.max(numeric_only=True)
-    
-#     # 簡單計算 percentage (數值 / 最大值 * 100)
-#     percentage_series = {}
-#     json_columns = ["totalPunchNum", "maxPunchSpeed", "hitRate", "minReactionTime", "maxPunchPower"]
-    
-#     for col in json_columns:
-#         val = rf_feats.get(col, 0)
-#         max_v = max_values.get(col, 1)
-#         if max_v == 0: max_v = 1
-        
-#         # Reaction Time 越小越好，反向計算
-#         if col == "minReactionTime":
-#              pct = max(0, (1 - val/max_v) * 100) # 簡易反向
-#         else:
-#              pct = (val / max_v) * 100
-#         percentage_series[col] = round(pct, 2)
-
-#     # 計算 Normalized Features (Formative Data)
-#     raw_data = calculate_detailed_stats_for_gpt(file_path)
-#     if not raw_data: return None
-    
-#     scaler = MinMaxScaler()
-#     normalized_features = {}
-    
-#     # 定義要 normalize 的 key
-#     keys_to_norm = [
-#         "reactionTime", "punchSpeed", "punchPower",
-#         "l_xavg", "l_yavg", "l_zavg",
-#         "r_xavg", "r_yavg", "r_zavg",
-#         "total_r_stability", "total_l_stability"
-#     ]
-    
-#     for key in keys_to_norm:
-#         arr = np.array(raw_data.get(key, []))
-#         if len(arr) == 0:
-#             normalized_features[f"normalize_{key}"] = []
-#         else:
-#             # Reshape for scalar
-#             reshaped = arr.reshape(-1, 1)
-#             norm = scaler.fit_transform(reshaped).flatten()
-#             # mapping key name to user's prompt expectation
-#             if key == "reactionTime": new_key = "normalize_reactionTime"
-#             elif key == "punchSpeed": new_key = "normalize_punchspeed"
-#             elif key == "punchPower": new_key = "normalize_punchPower"
-#             elif key == "l_xavg": new_key = "normalize_lhand_xaverge"
-#             elif key == "l_yavg": new_key = "normalize_lhand_yaverge"
-#             elif key == "l_zavg": new_key = "normalize_lhand_zaverge"
-#             elif key == "r_xavg": new_key = "normalize_rhand_xaverge"
-#             elif key == "r_yavg": new_key = "normalize_rhand_yaverge"
-#             elif key == "r_zavg": new_key = "normalize_rhand_zaverge"
-#             elif key == "total_r_stability": new_key = "normalize_total_rhand_stability"
-#             elif key == "total_l_stability": new_key = "normalize_total_lhand_stability"
-#             else: new_key = key
-            
-#             normalized_features[new_key] = norm.tolist()
-
-#     # 加入 Percentage Series
-#     normalized_features["Percentage Series"] = percentage_series
-    
-#     return normalized_features
 
 def prepare_data_for_gpt(file_path): #第二種把資料分開的
     global boxing_df
@@ -486,53 +421,7 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
         "formative_data": formative_normalized
     }
     
-#  呼叫 GPT API 判斷風格
-# def ask_gpt_for_style(normalized_features):
-
-#     normalized_features_serializable = {
-#         key: (value.tolist() if isinstance(value, np.ndarray) else value)
-#         for key, value in normalized_features.items()
-#     }
-    
-#     prompt = f"""
-#     You are a strict data classifier. Do not act as a coach. Do not explain.
-#     Task: Analyze the provided normalized boxing metrics (Speed, Power, Reaction Time).
-#     1. Summary Data (Percentage Series): Overall performance compared to the dataset. HIGHER IS BETTER.
-#     2. Formative Data (Normalized Metrics): Detailed movement habits during the session. 
-#     Identify the user's dominant style based on which normalized_features's normalize_value and normalized_features's Percentage Series, make sure which boxing style is suit for the current user.
-
-#     Input Data:
-#     {json.dumps(normalized_features_serializable, indent=2)}
-
-#     Output Options (Choose EXACTLY one):
-#     1. Agile Rapid Striker 靈敏速功選手 (Speed)
-#     2. Dominant Knockout Artist 壓迫KO藝術家 (Power)
-#     3. Precision Timing Specialist 精準時機掌控專家 (Reaction)
-
-#     Constraint:
-#     - Return ONLY the style name from the options above.
-#     - NO introduction, NO reasoning, NO explanation.
-#     - Example Output: Dominant Knockout Artist 壓迫KO藝術家 (Power)
-#     """
-#     print("正在傳送資料給 GPT 進行風格分析...")
-#     try:
-#         response = openai.ChatCompletion.create(
-#             # model="gpt-4o",
-#             model="gpt-3.5-turbo-0125", 
-#             messages=[
-#                 {"role": "system", "content": "You are a Professional Boxing Coach and Professional Data Analyst"},
-#                 {"role": "user", "content": prompt}
-#             ],
-#             max_tokens=200,
-#             temperature=0.6
-#         )
-#         result = response.choices[0].message["content"].strip()
-#         print(f"GPT 回傳結果: {result}")
-#         return result
-#     except Exception as e:
-#         print(f"GPT API 呼叫錯誤: {e}")
-#         return None
-    
+#  呼叫 GPT API 判斷風
 
 def ask_gpt_for_style(structured_data):
     # 強化的 Prompt，明確區分 Summary 與 Formative
@@ -585,10 +474,13 @@ def determine_style_from_gpt_result(gpt_text):
     text_lower = gpt_text.lower()
     
     if "speed" in text_lower or "rapid" in text_lower or "agile" in text_lower:
+        play_quick_voice("./quick_voice/maxPunchSpeed.wav")
         return "maxPunchSpeed"
     elif "power" in text_lower or "knockout" in text_lower or "dominant" in text_lower:
+        play_quick_voice("./quick_voice/maxPunchPower.wav")
         return "maxPunchPower"
     elif "reaction" in text_lower or "timing" in text_lower or "precision" in text_lower:
+        play_quick_voice("./quick_voice/minReactionTime.wav")
         return "minReactionTime"
     else:
         print("無法從 GPT 回覆中解析出明確風格，使用預設值 Power")
@@ -607,7 +499,28 @@ def play_quick_voice(file_path):
         print(f"播放中：{os.path.basename(file_path)}")
     except Exception as e:
         print(f"播放快速語音時發生錯誤：{e}")
-
+def play_voice_sequence(file_paths): #連續撥放多個音檔
+    try:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+            
+        if pygame.mixer.music.get_busy():
+            pygame.mixer.music.stop()
+            
+        for path in file_paths:
+            if os.path.exists(path):
+                print(f"播放片段：{os.path.basename(path)}")
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.play()
+                
+                # 阻塞等待直到播放完畢 (Block until finished)
+                while pygame.mixer.music.get_busy():
+                    pygame.time.Clock().tick(10) 
+            else:
+                print(f"找不到片段：{path}")
+                
+    except Exception as e:
+        print(f"序列播放錯誤：{e}")
 # def play_quick_voice(file_path):# 音效播放
 #     try:
 #         if pygame.mixer.get_init():
@@ -623,7 +536,7 @@ def play_quick_voice(file_path):
 LOWER_IS_BETTER_FEATURES = ["minReactionTime"]
 
 def process_feedback_with_style_logic(current_file_path):
-    global PREVIOUS_DATA, CURRENT_USER_STYLE
+    global PREVIOUS_DATA, CURRENT_USER_STYLE, ROUND_PUNCH_ACCUMULATOR
     
     try:
         current_data = extract_features_for_rf(current_file_path)
@@ -658,7 +571,17 @@ def process_feedback_with_style_logic(current_file_path):
     audio_to_play = None
     reason = ""
     feedback_mode = ""
-
+    number_diff = 0
+    current_punches = current_data.get('totalPunchNum', 0)
+    ROUND_PUNCH_ACCUMULATOR += current_punches
+    
+    # 計算還差多少拳才達到目標
+    remaining_punches = (previousboxstyle_totalpunchnum- ROUND_PUNCH_ACCUMULATOR)
+    if remaining_punches>0:
+        print(f"當前風格: {CURRENT_USER_STYLE} | 本次: {current_punches} | 累積: {ROUND_PUNCH_ACCUMULATOR} | 目標剩餘: {remaining_punches}")
+    else:
+        abs_remaining_punches=abs(remaining_punches)
+        print(f"當前風格: {CURRENT_USER_STYLE} | 本次: {current_punches} | 累積: {ROUND_PUNCH_ACCUMULATOR} | 已超出: {abs_remaining_punches}")
     if not target_improved:
         feedback_mode = "Style"
         print(f"風格 {CURRENT_USER_STYLE}沒有提升, 與之前的差異 ({prev_val:.2f} -> {curr_val:.2f})")
@@ -687,9 +610,12 @@ def process_feedback_with_style_logic(current_file_path):
         feedback_mode = "Score"
         print(f"{CURRENT_USER_STYLE} 提升了非常多 ({prev_val:.2f} -> {curr_val:.2f})")
         print("尋找合適提升score的語音")
+        thisround_punch=0
         weights = STYLE_WEIGHT_MAP[CURRENT_USER_STYLE]["scoring"]
         for feature, weight in weights:
             is_worse = False
+            curr_feat_val = current_data.get(feature, 0)
+            prev_feat_val = PREVIOUS_DATA.get(feature, 0)
             if feature == "minReactionTime":
                 if current_data[feature] > PREVIOUS_DATA[feature]: is_worse = True
             else:
@@ -699,28 +625,81 @@ def process_feedback_with_style_logic(current_file_path):
                 audio_to_play = FEATURE_AUDIO_MAP.get(feature)
                 if audio_to_play:
                     reason = f"得分關鍵: {feature} 下降 (權重 {weight:.4f})"
+                    if feature =="totalPunchNum":
+                        number_diff = remaining_punches
+                        print(f"偵測到出拳數減少：至少還需要 {number_diff} 拳")
+                        
                     break
-
     if audio_to_play:
-            play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE,feedback_mode, audio_to_play)
+        play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE,feedback_mode, audio_to_play)
+        playlist=[play_path]
+        if "totalPunchNum" in audio_to_play:
+            num_file = None
             
-            print(f"[播放] 語音: {audio_to_play} | 原因: {reason}")
-            print(f"路徑: {play_path}") # Debug
-            
-            if os.path.exists(play_path):
-                play_quick_voice(play_path)
+            if remaining_punches < 0:
+                # 情況 A: 已經超過目標 -> 播放 already_exceed.wav
+                # 這時候可能不需要播原本的 "你需要更多拳..."，看你需求，這裡我設為「只播 exceed」或「接在後面」
+                # 如果你想只播 exceed，就把 playlist 清空
+                playlist = [] 
+                num_file = "already_exceed.wav"
+                print(f"狀況: 目標已達成 (超標 {abs(remaining_punches)})")
+                
+            elif remaining_punches > 70:
+                # 情況 B: 還差很多 -> 播放 70over_.wav
+                num_file = "70over_.wav"
+                print(f"狀況: 還差很多 (>70)")
+                
             else:
-                print(f"找不到音檔: {play_path}")
+                # 情況 C: 0 < 剩餘 <= 70 -> 找最近的 10 的倍數
+                # math.ceil(15/10)*10 = 20, math.ceil(11/10)*10 = 20
+                # 這樣可以對應 10.wav, 20.wav ... 70.wav
+                val = math.ceil(remaining_punches / 10.0) * 10
+                num_file = f"{val}.wav"
+                print(f"狀況: 剩餘 {remaining_punches} -> 播放 {num_file}")
+
+            # 將數字音檔加入清單
+            if num_file:
+                # 假設數字檔案放在 quick_voice/numbers/ 資料夾
+                num_path = os.path.join(QUICK_VOICE_FOLDER, "numbers", num_file)
+                if os.path.exists(num_path):
+                    playlist.append(num_path)
+                else:
+                    print(f"缺少數字音檔: {num_path}")
+
+        print(f"[播放序列] {playlist} | 原因: {reason}")
+        
+        # 3. 使用執行緒呼叫連續播放，避免卡住主程式
+        threading.Thread(target=play_voice_sequence, args=(playlist,), daemon=True).start()
+
     else:
-            print(f"表現優秀！關鍵指標都在進步！")
-            best_file = "best.wav"
-            play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE, feedback_mode, best_file)
-            if os.path.exists(play_path):
-                print(f"[播放] 完美稱讚語音: {best_file}")
-                play_quick_voice(play_path)
-            else:
-                print(f"找不到完美稱讚語音: {play_path}")
-                print("請確認是否已在該風格資料夾中放入 best.wav")
+        print(f"表現優秀！關鍵指標都在進步！")
+        best_file = "best.wav"
+        play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE, feedback_mode, best_file)
+        if os.path.exists(play_path):
+            print(f"[播放] 完美稱讚語音: {best_file}")
+            play_quick_voice(play_path)
+        else:
+            print(f"找不到完美稱讚語音: {play_path}")
+            print("請確認是否已在該風格資料夾中放入 best.wav")
+    # if audio_to_play:
+    #         play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE,feedback_mode, audio_to_play)
+    #         print(f"[播放] 語音: {audio_to_play} | 原因: {reason}")
+    #         print(f"路徑: {play_path}") # Debug
+            
+    #         if os.path.exists(play_path):
+    #             play_quick_voice(play_path)
+    #         else:
+    #             print(f"找不到音檔: {play_path}")
+    # else:
+    #         print(f"表現優秀！關鍵指標都在進步！")
+    #         best_file = "best.wav"
+    #         play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE, feedback_mode, best_file)
+    #         if os.path.exists(play_path):
+    #             print(f"[播放] 完美稱讚語音: {best_file}")
+    #             play_quick_voice(play_path)
+    #         else:
+    #             print(f"找不到完美稱讚語音: {play_path}")
+    #             print("請確認是否已在該風格資料夾中放入 best.wav")
 
     PREVIOUS_DATA = current_data
 
@@ -741,7 +720,7 @@ DELAY_SEC = 4
 
 class JsonHandler(FileSystemEventHandler):
     def on_created(self, event):
-        global LAST_TRIGGER_TIME, FILE_PROCESS_COUNT, stop_monitoring
+        global LAST_TRIGGER_TIME, FILE_PROCESS_COUNT, stop_monitoring,ROUND_PUNCH_ACCUMULATOR 
         now = time.time()
         
         if now - LAST_TRIGGER_TIME < DELAY_SEC:
@@ -760,6 +739,7 @@ class JsonHandler(FileSystemEventHandler):
                 
                 if FILE_PROCESS_COUNT >= MAX_FILES_BEFORE_RESET:
                     print("\n>>> 已達 6 次一個round，換下一個新的user體驗")
+                    ROUND_PUNCH_ACCUMULATOR=0
                     stop_monitoring = True # 通知主迴圈停止
                     
             else:
@@ -836,6 +816,7 @@ if __name__ == "__main__":
             print(f"已選擇檔案：{os.path.basename(selected_file)}")
             print("正在建立 User 上一次基準數據...")
             PREVIOUS_DATA = extract_features_for_rf(selected_file)
+            previousboxstyle_totalpunchnum= PREVIOUS_DATA.get('totalPunchNum', 0)
             print(f"基準數據已建立 (Score: {PREVIOUS_DATA['score']})")
             
             # 3. 準備資料給 GPT
