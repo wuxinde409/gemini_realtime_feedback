@@ -7,22 +7,30 @@ import math
 import pygame
 import threading
 import openai
+import google.generativeai as genai
+from google import genai as google_genai
+from google.genai import types
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import MinMaxScaler
 from dotenv import load_dotenv
+from scipy import stats
 
 #設定 
 FOLDER_PATH = "./processed_users1/"  # 歷史資料資料夾 (用於訓練 RF)
 MONITOR_FOLDER = "./10sec/"          # 監控資料夾 (即時數據)
 QUICK_VOICE_FOLDER = "./quick_voice/" # 語音檔案資料夾
+ENG_QUICK_VOICE_FOLDER = './english_quick_voice/'
+JAP_QUICK_VOICE_FOLDER = './japanese_quick_voice/'
+CURRENT_VOICE_FOLDER = QUICK_VOICE_FOLDER
 load_dotenv("./.env",override=True)
-openai.api_key= os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
-    print("未輸入openAPIkey")
-else:
-    print("已取得apikey")
+# openai.api_key= os.getenv("OPENAI_API_KEY")
+# if not openai.api_key:
+#     print("未輸入openAPIkey")
+# else:
+#     print("已取得apikey")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 boxing_df = pd.DataFrame()
 STYLE_WEIGHT_MAP = {} 
 PREVIOUS_DATA = None
@@ -93,7 +101,7 @@ def get_ranges(logs):
 #     #     print(f"過濾異常數據檔案 : {os.path.basename(file_path)}")
 #     #     if not punch_num >= 0: print(" totalPunchNum < 0")
 #     #     if not 0 < max_speed <= 10: print(f"maxPunchSpeed 異常: {max_speed}")
-#     #     if not max_power <= 1000: print(f"maxPunchPower 異常: {max_power}")
+#     #     if not max_power <= 900: print(f"maxPunchPower 異常: {max_power}")
 #     #     return None
     
 #     player_logs = data.get('playerPosLogs', [])
@@ -146,6 +154,17 @@ def extract_features_for_rf(file_path):
     score = summary.get('score', 0)
     punch_num = summary.get('totalPunchNum', 1)
     if punch_num == 0: punch_num = 1
+    
+    # punch_power = data.get("punchPower", [])  #檢查異常
+    # max_power = max(punch_power) if punch_power else 0
+    # max_speed = summary.get('maxPunchSpeed', 0)
+    # punch_num = summary.get('totalPunchNum', 1)
+    # if not (punch_num >= 0 and 0 < max_speed <= 10 and max_power <= 1000):
+    #     print(f"過濾異常數據檔案 : {os.path.basename(file_path)}")
+    #     if not punch_num >= 0: print(" totalPunchNum < 0")
+    #     if not 0 < max_speed <= 10: print(f"maxPunchSpeed 異常: {max_speed}")
+    #     if not max_power <= 900: print(f"maxPunchPower 異常: {max_power}")
+    #     return None
     
     player_logs = data.get('playerPosLogs', [])
     r_hand_logs = data.get('playerRHandPosLogs', [])
@@ -385,19 +404,46 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
     # 分類Summary Data百分比排名
     percentage_series = {}
     json_columns = ["totalPunchNum", "maxPunchSpeed", "hitRate", "minReactionTime", "maxPunchPower"]
+    # for col in json_columns: #以前的計算
+    #     val = rf_feats.get(col, 0)
+    #     max_v = max_values.get(col, 1)
+    #     if col == "minReactionTime":
+    #          pct = max(0, (1 - val/max_v) * 100)
+    #     else:
+    #          pct = (val / max_v) * 100
     for col in json_columns:
+        # 1. 取得當前使用者的數值
         val = rf_feats.get(col, 0)
-        max_v = max_values.get(col, 1)
-        if col == "minReactionTime":
-             pct = max(0, (1 - val/max_v) * 100)
+        
+        # 2. 取得歷史資料庫中該欄位的所有數據 (去除空值)
+        # 這是關鍵：你的 val 要跟這群 ref_data 比排名
+        if col in boxing_df.columns:
+            ref_data = boxing_df[col].dropna()
         else:
-             pct = (val / max_v) * 100
-        percentage_series[col] = round(pct, 2)
+            # 防呆：如果資料庫沒這個欄位，給個預設值 50 分
+            percentage_series[col] = 50.0
+            continue
+
+        # 3. 計算 PR 值 (0 到 100)
+        # percentileofscore 會告訴你，val 勝過了 ref_data 中多少百分比的人
+        pr_score = stats.percentileofscore(ref_data, val, kind='weak')
+        
+        # 4. 特殊處理：反應時間 (越低越好)
+        # 如果反應時間勝過 90% 的人(數值很大)，代表他很慢，這是不對的。
+        # 所以對於反應時間，我們要用 100 去扣，或者直接取倒數排名。
+        if col == "minReactionTime":
+            # 邏輯反轉：數值越小(越快)，PR 應該越高
+            # 這裡我們簡單用 100 - 原本的 PR (假設數值大代表慢)
+            # 但更精確的做法是：數值越小，排名越前面
+            pr_score = 100 - pr_score
+        # percentage_series[col] = round(pct, 2)
+        percentage_series[col] = round(pr_score, 2)
 
     #  分類Formative Data正規化細節 
     raw_data = calculate_detailed_stats_for_gpt(file_path)
-    scaler = MinMaxScaler()
-    formative_normalized = {}
+    # scaler = MinMaxScaler()
+    # formative_normalized = {}
+    formative_analysis = {}
     
     keys_to_norm = {
         "reactionTime": "normalize_reactionTime",
@@ -409,78 +455,195 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
     
     for key, new_key in keys_to_norm.items():
         arr = np.array(raw_data.get(key, []))
-        if len(arr) > 0:
-            norm = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
-            formative_normalized[new_key] = norm.tolist()
-            # 額外加入平均值，幫助 GPT 快速抓到特徵
-            formative_normalized[f"{new_key}_mean"] = round(float(np.mean(norm)), 4)
-
-    # 最終傳出的結構
-    return {
-        "summary_data": percentage_series,
-        "formative_data": formative_normalized
+        # if len(arr) > 0: #第一種normalize
+        #     norm = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
+        #     formative_normalized[new_key] = norm.tolist()
+        #     # 額外加入平均值，幫助 GPT 快速抓到特徵
+        #     formative_normalized[f"{new_key}_mean"] = round(float(np.mean(norm)), 4)
+        
+        # if len(arr) > 1: # 至少需要兩筆資料來計算標準#第一種normalize
+        #     norm = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
+        #     mean_val = np.mean(norm)
+        #     std_val = np.std(norm)
+        #     # 計算變異係數 CV = 標準差 / 平均值
+        #     cv = std_val / mean_val if mean_val > 0 else 1
+        #     # 一致性 C = 1 - CV (限制在 0-1 之間)
+        #     consistency = max(0, min(1, 1 - cv))
+            
+        #     formative_analysis[f"{new_key}_intent"] = round(float(mean_val * 100), 2)
+        #     formative_analysis[f"{new_key}_consistency"] = round(float(consistency), 4)
+        # else:
+        #     formative_analysis[f"{new_key}_intent"] = 0
+        #     formative_analysis[f"{new_key}_consistency"] = 0
+        
+        user_arr = np.array(raw_data.get(key, []))
+        
+        if len(user_arr) > 1:# 1. 計算使用者自己的平均 (Intent) 與 穩定度 (Consistency)
+            
+            user_mean = np.mean(user_arr)
+            user_std = np.std(user_arr)
+            
+           
+            cv = user_std / user_mean if user_mean != 0 else 0 # 自身穩定度 (1 - CV)
+            consistency = max(0, min(1, 1 - cv)) # 限制在 0~1
+            
+            
+            if key in boxing_df.columns:# 2. 取得全域(歷史資料)的統計數據來比較
+                global_col = boxing_df[key].dropna()
+                global_mean = global_col.mean()
+                global_std = global_col.std()
+            else:
+                global_mean = user_mean # 防呆: 如果沒歷史資料，Z-score 就會是 0
+                global_std = 1
+            
+            # 3. 計算 Z-Score (這就是他在全體中的強度定位)
+            if global_std == 0: global_std = 1 # 避免除以零
+            z_score = (user_mean - global_mean) / global_std
+            
+            # 特殊處理: 反應時間越低(越快)越好，所以 Z-score 要反轉
+            if key == "reactionTime":
+                z_score = -z_score
+            
+            # 4. 為了讓 Gemini 好讀，我們可以把 Z-Score 轉成一個 0-100 的分數概念
+            # Z=0 -> 50分, Z=+2 -> 70分, Z=-2 -> 30分
+            # 這樣 Gemini 就能懂: >50 是強項，<50 是弱項
+            intent_score = 50 + (z_score * 10) 
+            
+            formative_analysis[f"{new_key}_intent_score"] = round(float(intent_score), 2)
+            formative_analysis[f"{new_key}_consistency"] = round(float(consistency), 4)
+            
+        else:
+            formative_analysis[f"{new_key}_intent_score"] = 0
+            formative_analysis[f"{new_key}_consistency"] = 0
+    return {    # 最終傳出的結構
+        "summary_data": percentage_series,# 這是 PR 值
+        "formative_data": formative_analysis# 這是 Z-Score 轉換分 + 一致性
     }
     
 #  呼叫 GPT API 判斷風
 
 def ask_gpt_for_style(structured_data):
     # 強化的 Prompt，明確區分 Summary 與 Formative
+    # prompt = f"""
+    # You are a data analyst. Your goal is to classify a boxer's style based on two distinct data types:
+    
+    # 1. Summary Data (Percentage Series): Overall performance compared to the dataset. HIGHER IS BETTER.
+    # 2. Formative Data (Normalized Metrics): Detailed movement habits during the session.
+
+    # Input Data:
+    # {json.dumps(structured_data, indent=2)}
+
+    # Classification Logic (Strict):
+    # Priority 1: Look at 'summary_data'. The style MUST match the metric with the HIGHEST percentage rank.
+    # If 'maxPunchPower' has the highest percentile (e.g., 90%), the style IS 'Dominant Knockout Artist'.
+    # If 'maxPunchSpeed ' has the highest percentile (e.g., 90%), the style IS 'Agile Rapid Striker'.
+    # If 'minReactionTime' has the highest percentile (e.g., 90%), the style IS 'Precision Timing Specialist'.
+    
+    # Use 'formative_data' ONLY to verify the consistency of movements.
+
+    # Output Options (CHOOSE ONE):
+    # Agile Rapid Striker 靈敏速功選手 (Speed)
+    # Dominant Knockout Artist 壓迫KO藝術家 (Power)
+    # Precision Timing Specialist 精準時機掌控專家 (Reaction)
+
+    # Constraint: Return ONLY the exact style name. No explanation.
+    # """
+    
+    
+    #裡面            1. Agile Rapid Striker (Speed):
+            # - High resonance in PunchSpeed and TotalPunchNum.
+            # 2. Dominant Knockout Artist (Power):
+            # - High resonance in PunchPower AND high stability in hand movements.
+            # 3. Precision Timing Specialist (Reaction):
+            # - High resonance in HitRate and ReactionTime.
     prompt = f"""
-    You are a data analyst. Your goal is to classify a boxer's style based on two distinct data types:
+        Act as an expert boxing coach and data analyst. Determine the boxer's 'Dominant Archetype' by analyzing the correlation between their results (Summary) and their habits (Formative).
+
+        Input Data:
+        {json.dumps(structured_data, indent=2)}
+
+        **Archetype Definitions & Indicators:**
+
+        **Scoring Logic (Weighted Resonance):**
+            For each metric (Speed, Power, Reaction), calculate a Resonance Score:
+            Score = (Result_Score * 0.5 + Intent_Score * 0.5) * Consistency_Weight
+
+            Where:
+            - Result_Score: Percentile from 'summary_results'.
+            - Intent_Score: Mean value from 'behavioral_habits'.
+            - Consistency_Weight: Reliability multiplier (0.0 to 1.0) from 'behavioral_habits'.
+
+            **Archetype Definitions:**
+            1. Agile Rapid Striker (Speed):
+            - High resonance in PunchSpeed .
+            2. Dominant Knockout Artist (Power):
+            - High resonance in PunchPower .
+            3. Precision Timing Specialist (Reaction):
+            - High resonance in  and ReactionTime.
+
+            **Decision Process:**
+            - If a trait has high 'summary_results' but low 'consistency', it is an outlier. DE-PRIORITIZE it.
+            - If 'intent' and 'results' both align with high 'consistency', this is a Resonant Style. PRIORITIZE it.
+
+            Output (CHOOSE ONE ONLY):
+            Agile Rapid Striker 靈敏速功選手 (Speed)
+            Dominant Knockout Artist 壓迫KO藝術家 (Power)
+            Precision Timing Specialist 精準時機掌控專家 (Reaction)
+
+            Constraint: Return ONLY the class label. No explanation.
+        """
     
-    1. Summary Data (Percentage Series): Overall performance compared to the dataset. HIGHER IS BETTER.
-    2. Formative Data (Normalized Metrics): Detailed movement habits during the session.
-
-    Input Data:
-    {json.dumps(structured_data, indent=2)}
-
-    Classification Logic (Strict):
-    Priority 1: Look at 'summary_data'. The style MUST match the metric with the HIGHEST percentage rank.
-    If 'maxPunchPower' has the highest percentile (e.g., 90%), the style IS 'Dominant Knockout Artist'.
-    If 'maxPunchSpeed ' has the highest percentile (e.g., 90%), the style IS 'Agile Rapid Striker'.
-    If 'minReactionTime' has the highest percentile (e.g., 90%), the style IS 'Precision Timing Specialist'.
-    
-    Use 'formative_data' ONLY to verify the consistency of movements.
-
-    Output Options (CHOOSE ONE):
-    Agile Rapid Striker 靈敏速功選手 (Speed)
-    Dominant Knockout Artist 壓迫KO藝術家 (Power)
-    Precision Timing Specialist 精準時機掌控專家 (Reaction)
-
-    Constraint: Return ONLY the exact style name. No explanation.
-    """
-    
+    # try:
+    #     response = openai.ChatCompletion.create(
+    #         # model="gpt-3.5-turbo-0125", 
+    #         model="chatgpt-4o-latest",
+    #         messages=[
+    #             {"role": "system", "content": "You are a precise classification engine."},
+    #             {"role": "user", "content": prompt}
+    #         ],
+    #         max_tokens=100,
+    #         temperature=0.2
+    #     )
+        # if hasattr(response, 'usage'):
+        #             used = response.usage
+        #             print(f" [GPT 用量] 輸入: {used.prompt_tokens} | 輸出: {used.completion_tokens} | 總計: {used.total_tokens} tokens")
+        # result = response.choices[0].message["content"].strip()
     try:
-        response = openai.ChatCompletion.create(
-            # model="gpt-3.5-turbo-0125", 
-            model="chatgpt-4o-latest",
-            messages=[
-                {"role": "system", "content": "You are a precise classification engine."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=100,
-            temperature=0.2
+        model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash-lite", 
+            system_instruction="You are a precise classification engine."
         )
-        result = response.choices[0].message["content"].strip()
-        print(f"GPT 最終風格判定: {result}")
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.3, #
+                max_output_tokens=100,
+            )
+        )
+        if response.usage_metadata:
+                used = response.usage_metadata
+                print(f"[Gemini 用量] 輸入: {used.prompt_token_count} | 輸出: {used.candidates_token_count} | 總計: {used.total_token_count}")
+        result = response.text.strip()
+        print(f"GEMINI 最終風格判定: {result}")
         return result
     except Exception as e:
-        print(f"GPT API 錯誤: {e}")
+        print(f"GEMINI  API 錯誤: {e}")
         return None
 #解析 GPT 回傳的文字，對應到系統內部的 Style Key
 def determine_style_from_gpt_result(gpt_text):
+    global CURRENT_VOICE_FOLDER
     if not gpt_text: return "maxPunchPower" # Default
     
     text_lower = gpt_text.lower()
     
     if "speed" in text_lower or "rapid" in text_lower or "agile" in text_lower:
-        play_quick_voice("./quick_voice/maxPunchSpeed.wav")
+        play_quick_voice(os.path.join(CURRENT_VOICE_FOLDER, "maxPunchSpeed.wav"))
         return "maxPunchSpeed"
     elif "power" in text_lower or "knockout" in text_lower or "dominant" in text_lower:
-        play_quick_voice("./quick_voice/maxPunchPower.wav")
+        play_quick_voice(os.path.join(CURRENT_VOICE_FOLDER, "maxPunchPower.wav")) 
         return "maxPunchPower"
     elif "reaction" in text_lower or "timing" in text_lower or "precision" in text_lower:
-        play_quick_voice("./quick_voice/minReactionTime.wav")
+        play_quick_voice(os.path.join(CURRENT_VOICE_FOLDER, "minReactionTime.wav"))
         return "minReactionTime"
     else:
         print("無法從 GPT 回覆中解析出明確風格，使用預設值 Power")
@@ -536,7 +699,7 @@ def play_voice_sequence(file_paths): #連續撥放多個音檔
 LOWER_IS_BETTER_FEATURES = ["minReactionTime"]
 
 def process_feedback_with_style_logic(current_file_path):
-    global PREVIOUS_DATA, CURRENT_USER_STYLE, ROUND_PUNCH_ACCUMULATOR
+    global PREVIOUS_DATA, CURRENT_USER_STYLE, ROUND_PUNCH_ACCUMULATOR, CURRENT_VOICE_FOLDER
     
     try:
         current_data = extract_features_for_rf(current_file_path)
@@ -631,7 +794,7 @@ def process_feedback_with_style_logic(current_file_path):
                         
                     break
     if audio_to_play:
-        play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE,feedback_mode, audio_to_play)
+        play_path = os.path.join(CURRENT_VOICE_FOLDER, CURRENT_USER_STYLE,feedback_mode, audio_to_play)
         playlist=[play_path]
         if "totalPunchNum" in audio_to_play:
             num_file = None
@@ -660,7 +823,7 @@ def process_feedback_with_style_logic(current_file_path):
             # 將數字音檔加入清單
             if num_file:
                 # 假設數字檔案放在 quick_voice/numbers/ 資料夾
-                num_path = os.path.join(QUICK_VOICE_FOLDER, "numbers", num_file)
+                num_path = os.path.join(CURRENT_VOICE_FOLDER, "numbers", num_file)
                 if os.path.exists(num_path):
                     playlist.append(num_path)
                 else:
@@ -672,9 +835,9 @@ def process_feedback_with_style_logic(current_file_path):
         threading.Thread(target=play_voice_sequence, args=(playlist,), daemon=True).start()
 
     else:
-        print(f"表現優秀！關鍵指標都在進步！")
+        print(f"表現優秀！所有數值都大幅提升！")
         best_file = "best.wav"
-        play_path = os.path.join(QUICK_VOICE_FOLDER, CURRENT_USER_STYLE, feedback_mode, best_file)
+        play_path = os.path.join(CURRENT_VOICE_FOLDER, CURRENT_USER_STYLE, feedback_mode, best_file)
         if os.path.exists(play_path):
             print(f"[播放] 完美稱讚語音: {best_file}")
             play_quick_voice(play_path)
@@ -810,7 +973,23 @@ if __name__ == "__main__":
                     selected_file = os.path.join(FOLDER_PATH, potential_name)
                 else:
                     print(f"找不到檔案：{user_input}，請檢查名稱是否正確。")
-
+        while True:
+            lang_input = input("\n請選擇語音語言 (C:Chinese / E:English / J:Japanese) : ").strip().upper()
+            
+            if lang_input == 'E':
+                CURRENT_VOICE_FOLDER = ENG_QUICK_VOICE_FOLDER
+                print(">> 已切換為：英文語音")
+                break # 輸入正確，跳出迴圈
+            elif lang_input == 'J':
+                CURRENT_VOICE_FOLDER = JAP_QUICK_VOICE_FOLDER
+                print(">> 已切換為：日文語音")
+                break
+            elif lang_input == 'C':
+                CURRENT_VOICE_FOLDER = QUICK_VOICE_FOLDER
+                print(">> 已切換為：中文語音")
+                break
+            else:
+                print("輸入錯誤！請只輸入 C, E ,J")
         # 成功選取檔案後，繼續執行
         try:
             print(f"已選擇檔案：{os.path.basename(selected_file)}")

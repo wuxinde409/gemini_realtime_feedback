@@ -16,12 +16,12 @@
     "maxPunchPower": 78.7216,
     "avgPunchSpeed": 1.0481,
     "hitRate": 88.4615,
-    "minReactionTime": 0.4104,
+    "minReactionTime": 0.4304,
     "avgReactionTime": 0.6662,
     "avgDist2Bag": 0.7385,
     "dist2Bag_Q44Q04": 0.0,
     "totalMoveDist": 22.9091,
-    "totalPunchNum": 9
+    "totalPunchNum": 52
   },
   "LogFramePerData": 2,
   "bagPosLogs": [
