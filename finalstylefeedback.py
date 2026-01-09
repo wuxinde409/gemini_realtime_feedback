@@ -6,6 +6,7 @@ import time
 import math
 import pygame
 import threading
+import traceback
 import openai
 import google.generativeai as genai
 from google import genai as google_genai
@@ -132,7 +133,7 @@ def get_ranges(logs):
 #     }
 #     return features
 
-def extract_features_for_rf(file_path):
+def extract_features_for_rf(file_path): #處理boxing_df需要的資料row,cloumn
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -140,7 +141,6 @@ def extract_features_for_rf(file_path):
         print(f"讀取檔案錯誤: {file_path}, 原因: {e}")
         return None
 
-    # (從 Summary 讀取，確保與 test3.py 一致)
     summary = data.get('summary', {})
     
     # 保留原本的過濾，防止異常數據影響權重
@@ -150,7 +150,12 @@ def extract_features_for_rf(file_path):
         # print(f"過濾異常檔案 (ReactionTime 異常): {os.path.basename(file_path)}")
         return None
     punch_power = data.get("punchPower", [])
+    if punch_power:
+        avgPunchPower = np.mean(punch_power)
+    else:
+        avgPunchPower = 0
     max_power = max(punch_power) if punch_power else 0
+
     score = summary.get('score', 0)
     punch_num = summary.get('totalPunchNum', 1)
     if punch_num == 0: punch_num = 1
@@ -185,7 +190,9 @@ def extract_features_for_rf(file_path):
         'maxPunchSpeed': summary.get('maxPunchSpeed', 0),
         'minReactionTime': summary.get('minReactionTime', 0),
         'hitRate': summary.get('hitRate', 0),
-        
+        'avgPunchSpeed' : summary.get('avgPunchSpeed',0),
+        'avgReactionTime':summary.get('avgReactionTime',0),
+        'avgPunchPower': avgPunchPower,
         # 新特徵 (Formative)
         'total_user_body_movement': body_dist,
         'total_hand_move_per_punch': total_move_per, 
@@ -196,8 +203,8 @@ def extract_features_for_rf(file_path):
     }
     
     return features
-# 將一開始的資料進行權重分析, 並建立boxing_df
-def load_all_json_files():
+
+def load_all_json_files():# 將一開始的資料進行權重分析, 並建立boxing_df
     global boxing_df
     data_list = []
     files = [f for f in os.listdir(FOLDER_PATH) if f.endswith(".json")]
@@ -255,7 +262,7 @@ def load_all_json_files():
         
 #         print(f"{target}style處理完成{STYLE_WEIGHT_MAP[target]["training"]}")
 #         print(f"{target}style的score權重處理完成{STYLE_WEIGHT_MAP[target]["scoring"]}")
-def init_style_weights(all_data):
+def init_style_weights(all_data): #權重處裡
     global STYLE_WEIGHT_MAP
     if not all_data: return
 
@@ -294,11 +301,11 @@ def init_style_weights(all_data):
         
         print(f"\n當前分析風格: {target}") #找出權重分析
         print(f"想提升 {target}，應該專注在:")
-        for name, val in STYLE_WEIGHT_MAP[target]["training"]: # 只印前5名
+        for name, val in STYLE_WEIGHT_MAP[target]["training"]: 
             print(f"{name:<30} (權重: {val:.4f})")
             
         print(f"在 {target} 的風格中，影響 Score 的是:")
-        for name, val in STYLE_WEIGHT_MAP[target]["scoring"]: # 只印前5名
+        for name, val in STYLE_WEIGHT_MAP[target]["scoring"]: 
             print(f"{name:<30} (權重: {val:.4f})")
 previousboxstyle_totalpunchnum=0
 # 送資料及正規劃給gpt
@@ -383,15 +390,14 @@ def calculate_detailed_stats_for_gpt(file_path):
         "reactionTime": reactionTime,
         "punchSpeed": punchSpeed,
         "punchPower": punchPower,
-        "l_xavg": l_xavg, "l_yavg": l_yavg, "l_zavg": l_zavg,
-        "r_xavg": r_xavg, "r_yavg": r_yavg, "r_zavg": r_zavg,
-        "total_r_stability": [std_r], # 模擬 user 的 list 結構
-        "total_l_stability": [std_l]
+        "l_xavg": l_xavg, "l_yavg": l_yavg, "l_zavg": l_zavg, #左手平均值
+        "r_xavg": r_xavg, "r_yavg": r_yavg, "r_zavg": r_zavg, #右手平均值
+        # "total_r_stability": [std_r], # 模擬 user 的 list 結構
+        # "total_l_stability": [std_l]
     }
     return raw_data
 
 #準備 Prompt 需要的 Normalized Features 與 Percentage Series
-
 def prepare_data_for_gpt(file_path): #第二種把資料分開的
     global boxing_df
     
@@ -403,7 +409,7 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
     
     # 分類Summary Data百分比排名
     percentage_series = {}
-    json_columns = ["totalPunchNum", "maxPunchSpeed", "hitRate", "minReactionTime", "maxPunchPower"]
+    json_columns = ["totalPunchNum", "maxPunchSpeed", "hitRate", "minReactionTime", "maxPunchPower","avgPunchPower","avgPunchSpeed","avgReactionTime"]
     # for col in json_columns: #以前的計算
     #     val = rf_feats.get(col, 0)
     #     max_v = max_values.get(col, 1)
@@ -431,7 +437,7 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
         # 4. 特殊處理：反應時間 (越低越好)
         # 如果反應時間勝過 90% 的人(數值很大)，代表他很慢，這是不對的。
         # 所以對於反應時間，我們要用 100 去扣，或者直接取倒數排名。
-        if col == "minReactionTime":
+        if col == "minReactionTime" or col == "avgReactionTime":
             # 邏輯反轉：數值越小(越快)，PR 應該越高
             # 這裡我們簡單用 100 - 原本的 PR (假設數值大代表慢)
             # 但更精確的做法是：數值越小，排名越前面
@@ -449,47 +455,24 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
         "reactionTime": "normalize_reactionTime",
         "punchSpeed": "normalize_punchspeed",
         "punchPower": "normalize_punchPower",
-        "total_r_stability": "normalize_rhand_stability",
-        "total_l_stability": "normalize_lhand_stability"
+        # "total_r_stability": "normalize_rhand_stability",
+        # "total_l_stability": "normalize_lhand_stability"
     }
-    
+    key_mapping = {
+            "reactionTime": "avgReactionTime", # 對應到 avg
+            "punchSpeed": "avgPunchSpeed",     # 對應到 avg
+            "punchPower": "avgPunchPower",     # 對應到 avg
+        }
     for key, new_key in keys_to_norm.items():
-        arr = np.array(raw_data.get(key, []))
-        # if len(arr) > 0: #第一種normalize
-        #     norm = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
-        #     formative_normalized[new_key] = norm.tolist()
-        #     # 額外加入平均值，幫助 GPT 快速抓到特徵
-        #     formative_normalized[f"{new_key}_mean"] = round(float(np.mean(norm)), 4)
-        
-        # if len(arr) > 1: # 至少需要兩筆資料來計算標準#第一種normalize
-        #     norm = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
-        #     mean_val = np.mean(norm)
-        #     std_val = np.std(norm)
-        #     # 計算變異係數 CV = 標準差 / 平均值
-        #     cv = std_val / mean_val if mean_val > 0 else 1
-        #     # 一致性 C = 1 - CV (限制在 0-1 之間)
-        #     consistency = max(0, min(1, 1 - cv))
-            
-        #     formative_analysis[f"{new_key}_intent"] = round(float(mean_val * 100), 2)
-        #     formative_analysis[f"{new_key}_consistency"] = round(float(consistency), 4)
-        # else:
-        #     formative_analysis[f"{new_key}_intent"] = 0
-        #     formative_analysis[f"{new_key}_consistency"] = 0
-        
         user_arr = np.array(raw_data.get(key, []))
-        
         if len(user_arr) > 1:# 1. 計算使用者自己的平均 (Intent) 與 穩定度 (Consistency)
-            
             user_mean = np.mean(user_arr)
             user_std = np.std(user_arr)
-            
-           
             cv = user_std / user_mean if user_mean != 0 else 0 # 自身穩定度 (1 - CV)
             consistency = max(0, min(1, 1 - cv)) # 限制在 0~1
-            
-            
-            if key in boxing_df.columns:# 2. 取得全域(歷史資料)的統計數據來比較
-                global_col = boxing_df[key].dropna()
+            target_col = key_mapping.get(key)
+            if target_col and target_col in boxing_df.columns:# 2. 取得全域(歷史資料)的統計數據來比較
+                global_col = boxing_df[target_col].dropna()
                 global_mean = global_col.mean()
                 global_std = global_col.std()
             else:
@@ -515,6 +498,27 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
         else:
             formative_analysis[f"{new_key}_intent_score"] = 0
             formative_analysis[f"{new_key}_consistency"] = 0
+        # arr = np.array(raw_data.get(key, []))
+        # if len(arr) > 0: #第一種normalize
+        #     norm = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
+        #     formative_normalized[new_key] = norm.tolist()
+        #     # 額外加入平均值，幫助 GPT 快速抓到特徵
+        #     formative_normalized[f"{new_key}_mean"] = round(float(np.mean(norm)), 4)
+        
+        # if len(arr) > 1: # 至少需要兩筆資料來計算標準#第一種normalize
+        #     norm = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
+        #     mean_val = np.mean(norm)
+        #     std_val = np.std(norm)
+        #     # 計算變異係數 CV = 標準差 / 平均值
+        #     cv = std_val / mean_val if mean_val > 0 else 1
+        #     # 一致性 C = 1 - CV (限制在 0-1 之間)
+        #     consistency = max(0, min(1, 1 - cv))
+            
+        #     formative_analysis[f"{new_key}_intent"] = round(float(mean_val * 100), 2)
+        #     formative_analysis[f"{new_key}_consistency"] = round(float(consistency), 4)
+        # else:
+        #     formative_analysis[f"{new_key}_intent"] = 0
+        #     formative_analysis[f"{new_key}_consistency"] = 0
     return {    # 最終傳出的結構
         "summary_data": percentage_series,# 這是 PR 值
         "formative_data": formative_analysis# 這是 Z-Score 轉換分 + 一致性
@@ -557,12 +561,12 @@ def ask_gpt_for_style(structured_data):
             # 3. Precision Timing Specialist (Reaction):
             # - High resonance in HitRate and ReactionTime.
     prompt = f"""
-        Act as an expert boxing coach and data analyst. Determine the boxer's 'Dominant Archetype' by analyzing the correlation between their results (Summary) and their habits (Formative).
+        Act as an expert boxing coach and data analyst. Determine the user's 'boxing style' by analyzing the correlation between their results (Summary) and their sport movements (Formative).
 
         Input Data:
         {json.dumps(structured_data, indent=2)}
 
-        **Archetype Definitions & Indicators:**
+        Archetype Definitions & Indicators:
 
         **Scoring Logic (Weighted Resonance):**
             For each metric (Speed, Power, Reaction), calculate a Resonance Score:
@@ -610,7 +614,8 @@ def ask_gpt_for_style(structured_data):
         # result = response.choices[0].message["content"].strip()
     try:
         model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash-lite", 
+            # model_name="gemini-2.5-flash-lite", 
+            model_name="gemini-2.5-flash", 
             system_instruction="You are a precise classification engine."
         )
         response = model.generate_content(
@@ -1000,6 +1005,7 @@ if __name__ == "__main__":
             
             # 3. 準備資料給 GPT
             gpt_features = prepare_data_for_gpt(selected_file)
+            print(f"這邊是傳入LLM的輸入{gpt_features}")
             if gpt_features:
                 gpt_result_text = ask_gpt_for_style(gpt_features)
                 CURRENT_USER_STYLE = determine_style_from_gpt_result(gpt_result_text)
@@ -1010,6 +1016,7 @@ if __name__ == "__main__":
                 
         except Exception as e:
             print(f"發生異常: {e}")
+            traceback.print_exc()
             CURRENT_USER_STYLE = "maxPunchPower"
             print("使用預設風格 Power")
 
