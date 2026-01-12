@@ -468,7 +468,7 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
         if len(user_arr) > 1:# 1. 計算使用者自己的平均 (Intent) 與 穩定度 (Consistency)
             user_mean = np.mean(user_arr)
             user_std = np.std(user_arr)
-            cv = user_std / user_mean if user_mean != 0 else 0 # 自身穩定度 (1 - CV)
+            cv = user_std / user_mean if user_mean != 0 else 0 # 自身穩定度 (1 - CV) Coefficient of Variation
             consistency = max(0, min(1, 1 - cv)) # 限制在 0~1
             target_col = key_mapping.get(key)
             if target_col and target_col in boxing_df.columns:# 2. 取得全域(歷史資料)的統計數據來比較
