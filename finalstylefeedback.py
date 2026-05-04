@@ -1,8 +1,14 @@
 import os
+import warnings
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import json
 import numpy as np
 import pandas as pd
 import time
+# from gtts import gTTS
+import asyncio
+import edge_tts
+import uuid
 import math
 import pygame
 import threading
@@ -25,6 +31,7 @@ QUICK_VOICE_FOLDER = "./quick_voice/" # 語音檔案資料夾
 ENG_QUICK_VOICE_FOLDER = './english_quick_voice/'
 JAP_QUICK_VOICE_FOLDER = './japanese_quick_voice/'
 CURRENT_VOICE_FOLDER = QUICK_VOICE_FOLDER
+FINAL_VOICE_FOLDER = "./final30sec_voice/" #最後的30秒語音總結
 load_dotenv("./.env",override=True)
 # openai.api_key= os.getenv("OPENAI_API_KEY")
 # if not openai.api_key:
@@ -37,7 +44,7 @@ STYLE_WEIGHT_MAP = {}
 PREVIOUS_DATA = None
 CURRENT_USER_STYLE = None # 預設風格
 FILE_PROCESS_COUNT = 0  # 計算處理過的檔案數量
-MAX_FILES_BEFORE_RESET = 6  #看你幾秒一組就 30/x= MAX_FILES_BEFORE_RESET
+MAX_FILES_BEFORE_RESET = 2  #看你幾秒一組就 30/x= MAX_FILES_BEFORE_RESET
 stop_monitoring = False
 ROUND_PUNCH_ACCUMULATOR = 0
 
@@ -607,39 +614,7 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
 #  呼叫 GPT API 判斷風
 
 def ask_gpt_for_style(structured_data):
-    # 強化的 Prompt，明確區分 Summary 與 Formative
-    # prompt = f"""
-    # You are a data analyst. Your goal is to classify a boxer's style based on two distinct data types:
-    
-    # 1. Summary Data (Percentage Series): Overall performance compared to the dataset. HIGHER IS BETTER.
-    # 2. Formative Data (Normalized Metrics): Detailed movement habits during the session.
 
-    # Input Data:
-    # {json.dumps(structured_data, indent=2)}
-
-    # Classification Logic (Strict):
-    # Priority 1: Look at 'summary_data'. The style MUST match the metric with the HIGHEST percentage rank.
-    # If 'maxPunchPower' has the highest percentile (e.g., 90%), the style IS 'Dominant Knockout Artist'.
-    # If 'maxPunchSpeed ' has the highest percentile (e.g., 90%), the style IS 'Agile Rapid Striker'.
-    # If 'minReactionTime' has the highest percentile (e.g., 90%), the style IS 'Precision Timing Specialist'.
-    
-    # Use 'formative_data' ONLY to verify the consistency of movements.
-
-    # Output Options (CHOOSE ONE):
-    # Agile Rapid Striker 靈敏速功選手 (Speed)
-    # Dominant Knockout Artist 壓迫KO藝術家 (Power)
-    # Precision Timing Specialist 精準時機掌控專家 (Reaction)
-
-    # Constraint: Return ONLY the exact style name. No explanation.
-    # """
-    
-    
-    #裡面            1. Agile Rapid Striker (Speed):
-            # - High resonance in PunchSpeed and TotalPunchNum.
-            # 2. Dominant Knockout Artist (Power):
-            # - High resonance in PunchPower AND high stability in hand movements.
-            # 3. Precision Timing Specialist (Reaction):
-            # - High resonance in HitRate and ReactionTime.
     prompt = f"""
         Act as an expert boxing coach and data analyst. Determine the user's 'boxing style' by analyzing the correlation between their results (Summary) and their sport movements (Formative).
 
@@ -653,21 +628,21 @@ def ask_gpt_for_style(structured_data):
             Score = (Result_Score * 0.5 + Intent_Score * 0.5) * Consistency_Weight
 
             Where:
-            - Result_Score: Percentile from 'summary_results'.
-            - Intent_Score: Mean value from 'behavioral_habits'.
-            - Consistency_Weight: Reliability multiplier (0.0 to 1.0) from 'behavioral_habits'.
+            Result_Score: Percentile from 'summary_results'.
+            Intent_Score: Mean value from 'behavioral_habits'.
+            Consistency_Weight: Reliability multiplier (0.0 to 1.0) from 'behavioral_habits'.
 
             **Archetype Definitions:**
             1. Agile Rapid Striker (Speed):
-            - High resonance in PunchSpeed .
+            High resonance in PunchSpeed .
             2. Dominant Knockout Artist (Power):
-            - High resonance in PunchPower .
+            High resonance in PunchPower .
             3. Precision Timing Specialist (Reaction):
-            - High resonance in  and ReactionTime.
+            High resonance in  and ReactionTime.
 
             **Decision Process:**
-            - If a trait has high 'summary_results' but low 'consistency', it is an outlier. DE-PRIORITIZE it.
-            - If 'intent' and 'results' both align with high 'consistency', this is a Resonant Style. PRIORITIZE it.
+            If a trait has high 'summary_results' but low 'consistency', it is an outlier. DE-PRIORITIZE it.
+            If 'intent' and 'results' both align with high 'consistency', this is a Resonant Style. PRIORITIZE it.
 
             Output (CHOOSE ONE ONLY):
             Agile Rapid Striker 靈敏速功選手 (Speed)
@@ -783,7 +758,7 @@ def play_voice_sequence(file_paths): #連續撥放多個音檔
 # 核心回饋邏輯 
 LOWER_IS_BETTER_FEATURES = ["minReactionTime"]
 
-def process_feedback_with_style_logic(current_file_path):
+def process_feedback_with_style_logic(current_file_path,skip_audio):
     global PREVIOUS_DATA, CURRENT_USER_STYLE, ROUND_PUNCH_ACCUMULATOR, CURRENT_VOICE_FOLDER
     
     try:
@@ -916,8 +891,11 @@ def process_feedback_with_style_logic(current_file_path):
         print(f"[播放序列] {playlist} | 原因: {reason}")
         
         # 3. 使用執行緒呼叫連續播放，避免卡住主程式
-        threading.Thread(target=play_voice_sequence, args=(playlist,), daemon=True).start()
-
+        # threading.Thread(target=play_voice_sequence, args=(playlist,), daemon=True).start()
+        if not skip_audio:
+            threading.Thread(target=play_voice_sequence, args=(playlist,), daemon=True).start()
+        else:
+            print("[系統] 這是第 6 個檔案，略過一般語音，準備播放 AI 總結語音。")
     else:
         print(f"表現優秀！所有數值都大幅提升！")
         best_file = "best.wav"
@@ -978,19 +956,109 @@ class JsonHandler(FileSystemEventHandler):
         if not event.is_directory and event.src_path.endswith("json"):
             print(f"\n偵測到新 JSON 檔案：{event.src_path}")
             if wait_for_file_release(event.src_path):
-                process_feedback_with_style_logic(event.src_path)
-                
-                # [新增] 計數與重置邏輯
+                #判斷這是不是這一局的最後一個檔案
+                is_last_file = (FILE_PROCESS_COUNT + 1) >= MAX_FILES_BEFORE_RESET 
+                # 傳入 skip_audio 參數。如果是最後一次，它就只會算數據，不會播語音
+                process_feedback_with_style_logic(event.src_path, skip_audio=is_last_file)
                 FILE_PROCESS_COUNT += 1
                 print(f"目前已處理 {FILE_PROCESS_COUNT}/{MAX_FILES_BEFORE_RESET} 個檔案")
-                
-                if FILE_PROCESS_COUNT >= MAX_FILES_BEFORE_RESET:
-                    print("\n>>> 已達 6 次一個round，換下一個新的user體驗")
+                if is_last_file:
+                    print("\n>>> 已達 6 次一個round，開始生成 30 秒總結回饋！")
+                    generate_round_summary_and_voice(event.src_path, CURRENT_USER_STYLE)
+                    
+                    print("\n>>> 總結完畢，準備換下一個新的user體驗")
                     ROUND_PUNCH_ACCUMULATOR=0
                     stop_monitoring = True # 通知主迴圈停止
+            # if wait_for_file_release(event.src_path): 原本舊版本, 沒有30秒那版
+            #     process_feedback_with_style_logic(event.src_path)
+                
+            #     # [新增] 計數與重置邏輯
+            #     FILE_PROCESS_COUNT += 1
+            #     print(f"目前已處理 {FILE_PROCESS_COUNT}/{MAX_FILES_BEFORE_RESET} 個檔案")
+                
+            #     if FILE_PROCESS_COUNT >= MAX_FILES_BEFORE_RESET:
+            #         generate_round_summary_and_voice(event.src_path, CURRENT_USER_STYLE)
+            #         print("\n>>> 已達 6 次一個round，換下一個新的user體驗")
+            #         ROUND_PUNCH_ACCUMULATOR=0
+            #         stop_monitoring = True # 通知主迴圈停止
                     
             else:
                 print(f"無法讀取：{event.src_path}")
+                
+def generate_round_summary_and_voice(file_path, style):   #處理最後30秒的語音播報
+    global CURRENT_VOICE_FOLDER, ENG_QUICK_VOICE_FOLDER, JAP_QUICK_VOICE_FOLDER
+    print("\n系統: 正在產生 30 秒回合總結與語音...")
+
+    gpt_features = prepare_data_for_gpt(file_path)
+    if not gpt_features:
+        print("無法取得總結數據")
+        return
+
+    # 語言設定與 Prompt
+    prompt_lang_instruction = "請用繁體中文，以口語化、有活力的教練風格回答。"
+    
+    
+    voice_model = 'zh-TW-HsiaoChenNeural' 
+    
+    if CURRENT_VOICE_FOLDER == ENG_QUICK_VOICE_FOLDER:
+        prompt_lang_instruction = "Please reply in English with an energetic coach tone."
+        voice_model = 'en-US-AriaNeural' # 英文女聲
+    elif CURRENT_VOICE_FOLDER == JAP_QUICK_VOICE_FOLDER:
+        prompt_lang_instruction = "日本語で、元気なコーチの口調で答えてください。"
+        voice_model = 'ja-JP-NanamiNeural' # 日文女聲
+
+    prompt = f"""
+    Act as an encouraging expert boxing coach. The user just finished a 30-second round.
+    Their target style was: {style}.
+    Here is their overall data for the round:
+    {json.dumps(gpt_features, indent=2)}
+    Based on the overall data, segment the performance into three distinct 10-second phases—early, middle, and late—and analytically evaluate the execution status within each interval. Please provide targeted, actionable improvements tailored to the specific deficits observed during these individual phases. After this temporal breakdown, conclude by clearly identifying the user's primary overall strength throughout the entire session. Furthermore, isolate one specific quantitative metric or precise biomechanical movement that requires immediate adjustment. Explain exactly how refining this single variable will either significantly elevate the total score or further amplify their core advantage. Ensure your explanation is highly detailed, objective, and presented in a calm, technical coaching tone.
+    
+    {prompt_lang_instruction}
+    CRITICAL: 
+    1.Output ONLY plain text that is ready to be spoken. Do NOT use markdown, emojis, asterisks (*), or hashtags.
+    2. STRICT LENGTH LIMIT: Your entire response MUST be under 150 words. Be concise and direct.
+    """
+    # Please provide a short, punchy, and encouraging summary of their performance (2-3 sentences max), Focus on their style execution and overall effort..
+    
+    try: #  改用時間記命名，並加上資料夾路徑
+        
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        response = model.generate_content(prompt)
+        summary_text = response.text.strip()
+        print(f"\n Gemini 回傳文字: {summary_text}")
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        audio_filename = f"summary_{timestamp}.mp3"
+        audio_file = os.path.join(FINAL_VOICE_FOLDER, audio_filename)
+
+        # (使用 Edge TTS)
+        async def create_tts():
+            # 【在這裡調整語速和音調！】
+            # rate="+15%" 代表變快 15%，rate="-10%" 代表變慢 10%
+            # pitch="+5Hz" 代表音調變高，pitch="-5Hz" 代表音調變低
+            communicate = edge_tts.Communicate(summary_text, voice_model, rate="+15%", pitch="+0Hz")
+            await communicate.save(audio_file)
+            
+        # 執行轉換
+        asyncio.run(create_tts())
+
+        # 播放語音
+        print(f"play final voice response: {audio_file}")
+        if pygame.mixer.music.get_busy():
+            pygame.mixer.music.stop()
+            
+        pygame.mixer.music.load(audio_file)
+        pygame.mixer.music.play()
+
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+
+
+    except Exception as e:
+        print(f"生成總結語音時發生錯誤: {e}")        
+                
+                
 if __name__ == "__main__":
     print("\n開始處理原先資料庫並分配權重")
     load_all_json_files() 
@@ -1111,6 +1179,9 @@ if __name__ == "__main__":
         print(f"開始監控資料夾：{MONITOR_FOLDER}")
         print(f"監控中... (蒐集滿 {MAX_FILES_BEFORE_RESET} 個檔案後將重置)")
         
+        if not os.path.exists(FINAL_VOICE_FOLDER):
+            os.makedirs(FINAL_VOICE_FOLDER)
+            print(f"建立總結語音資料夾: {FINAL_VOICE_FOLDER}")
         observer.start()
         
         try:
