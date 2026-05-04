@@ -203,27 +203,110 @@ def extract_features_for_rf(file_path): #處理boxing_df需要的資料row,cloum
     }
     
     return features
+#新增
+import concurrent.futures # 用於多核心並行處理
+CACHE_FILE = "boxing_history_cache.pkl"
 
-def load_all_json_files():# 將一開始的資料進行權重分析, 並建立boxing_df
+def process_file_wrapper(filename):
+    file_path = os.path.join(FOLDER_PATH, filename)
+    try:
+        # 取得檔案資訊
+        stat = os.stat(file_path)
+        if stat.st_size > 0:
+            # 呼叫原本的特徵提取函式
+            feats = extract_features_for_rf(file_path)
+            if feats:
+                feats['filename'] = filename
+                feats['mtime'] = stat.st_mtime # [新增] 紀錄檔案修改時間
+                return feats
+    except Exception:
+        pass
+    return None
+
+def load_all_json_files():
     global boxing_df
-    data_list = []
-    files = [f for f in os.listdir(FOLDER_PATH) if f.endswith(".json")]
-    print(f"正在載入 {len(files)} 筆歷史資料...")
+    last_processed_time = 0
+    # 嘗試讀取(Cache)
+    if os.path.exists(CACHE_FILE):
+        print("正在讀取歷史快取資料...")
+        try:
+            boxing_df = pd.read_pickle(CACHE_FILE)
+            print(f" Cache載入成功，包含 {len(boxing_df)} 筆資料。")
+            if 'mtime' in boxing_df.columns:
+                last_processed_time = boxing_df['mtime'].max()
+                print(f"上次更新時間: {last_processed_time:.2f}")
+            else:
+                last_processed_time = os.path.getmtime(CACHE_FILE)
+                # print(" 舊版快取無時間")
+        except Exception as e:
+            print(f" 快取讀取失敗 ({e})，將重新建立...")
+            boxing_df = pd.DataFrame()
+            processed_files = set()
+    else:
+        print("無快取檔案，準備建立新資料庫...")
+        boxing_df = pd.DataFrame()
+    new_files_to_process = []
+    with os.scandir(FOLDER_PATH) as entries:
+        for entry in entries:
+            # 只挑選：是檔案 + 是json + 修改時間比上次紀錄還新
+            if entry.is_file() and entry.name.endswith(".json"):
+                if entry.stat().st_mtime > last_processed_time:
+                    new_files_to_process.append(entry.name)
     
-    for filename in files:
-        file_path = os.path.join(FOLDER_PATH, filename)
-        if os.path.getsize(file_path) > 0:
-            try:
-                feats = extract_features_for_rf(file_path)
-                if feats is not None:
-                    data_list.append(feats)
-            except Exception as e:
-                print(f"處理檔案發生未預期錯誤 {filename}: {e}")
-                continue
+    # 3. 如果有新檔案，啟動「多進程並行運算」
+    if new_files_to_process:
+        print(f"發現 {len(new_files_to_process)} 筆新資料，啟動多核心加速處理中...")
+        
+        new_data_list = []
+        start_time = time.time()
+        
+        # 使用 ProcessPoolExecutor 發動多核引擎
+       
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            results = executor.map(process_file_wrapper, new_files_to_process)
+            for res in results:
+                if res is not None:
+                    new_data_list.append(res)
+        
+        end_time = time.time()
+        print(f" 新資料處理完成！耗時: {end_time - start_time:.2f} 秒")
+
+        # 合併並更新快取
+        if new_data_list:
+            new_df = pd.DataFrame(new_data_list)
+            # 將新舊資料合併
+            if not boxing_df.empty and 'filename' in boxing_df.columns:
+                new_filenames = set(new_df['filename'])
+                boxing_df = boxing_df[~boxing_df['filename'].isin(new_filenames)]
+            boxing_df = pd.concat([boxing_df, new_df], ignore_index=True)
+            boxing_df.to_pickle(CACHE_FILE)            # 存回快取檔 
+            print(f" 資料庫已更新並儲存至 {CACHE_FILE} (目前共 {len(boxing_df)} 筆)")
+        else:
+            print("新檔案似乎都是無效或異常數據，未新增至資料庫。")
+    else:
+        print("資料庫已是最新，無需更新。")
+
+    print("歷史資料載入完成\n")
+# def load_all_json_files():# 將一開始的資料進行權重分析, 並建立boxing_df
+#     global boxing_df
+#     data_list = []
+#     files = [f for f in os.listdir(FOLDER_PATH) if f.endswith(".json")]
+#     print(f"正在載入 {len(files)} 筆歷史資料...")
+    
+#     for filename in files:
+#         file_path = os.path.join(FOLDER_PATH, filename)
+#         if os.path.getsize(file_path) > 0:
+#             try:
+#                 feats = extract_features_for_rf(file_path)
+#                 if feats is not None:
+#                     data_list.append(feats)
+#             except Exception as e:
+#                 print(f"處理檔案發生未預期錯誤 {filename}: {e}")
+#                 continue
                 
-    boxing_df = pd.DataFrame(data_list)
-    print(f"boxinfdf={boxing_df}")
-    print("歷史資料載入完成")
+#     boxing_df = pd.DataFrame(data_list)
+#     print(f"boxinfdf={boxing_df}")
+#     print("歷史資料載入完成")
 
 
 # def init_style_weights(all_data): #訓練RF 模型，並將每個風格特質拳種 score拳種紀錄起來, 舊版
@@ -287,14 +370,14 @@ def init_style_weights(all_data): #權重處裡
             other_summary_cols.remove("maxPunchPower")
 
         feature_cols_A = formative_cols + other_summary_cols
-        rf_train = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf_train = RandomForestRegressor(n_estimators=30, n_jobs=-1,random_state=42)
         rf_train.fit(df[feature_cols_A], df[target])
         imp_train = pd.Series(rf_train.feature_importances_, index=feature_cols_A).sort_values(ascending=False)
         STYLE_WEIGHT_MAP[target]["training"] = list(imp_train.items())
 
         # Scoring
         features_for_score = formative_cols + [target, 'hitRate', 'totalPunchNum']
-        rf_score = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf_score = RandomForestRegressor(n_estimators=30, n_jobs=-1, random_state=42)
         rf_score.fit(df[features_for_score], df['score'])
         imp_score = pd.Series(rf_score.feature_importances_, index=features_for_score).sort_values(ascending=False)
         STYLE_WEIGHT_MAP[target]["scoring"] = list(imp_score.items())
@@ -412,7 +495,7 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
     json_columns = ["totalPunchNum", "maxPunchSpeed", "hitRate", "minReactionTime", "maxPunchPower","avgPunchPower","avgPunchSpeed","avgReactionTime"]
     # for col in json_columns: #以前的計算
     #     val = rf_feats.get(col, 0)
-    #     max_v = max_values.get(col, 1)
+    #     max_v = max_values.get(col, 1) 
     #     if col == "minReactionTime":
     #          pct = max(0, (1 - val/max_v) * 100)
     #     else:
@@ -421,12 +504,11 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
         # 1. 取得當前使用者的數值
         val = rf_feats.get(col, 0)
         
-        # 2. 取得歷史資料庫中該欄位的所有數據 (去除空值)
-        # 這是關鍵：你的 val 要跟這群 ref_data 比排名
+        # 2. 取得歷史資料庫中該欄位的所有數據 
         if col in boxing_df.columns:
             ref_data = boxing_df[col].dropna()
         else:
-            # 防呆：如果資料庫沒這個欄位，給個預設值 50 分
+            # 如果資料庫沒這個欄位，給個預設值 50 分
             percentage_series[col] = 50.0
             continue
 
@@ -439,8 +521,6 @@ def prepare_data_for_gpt(file_path): #第二種把資料分開的
         # 所以對於反應時間，我們要用 100 去扣，或者直接取倒數排名。
         if col == "minReactionTime" or col == "avgReactionTime":
             # 邏輯反轉：數值越小(越快)，PR 應該越高
-            # 這裡我們簡單用 100 - 原本的 PR (假設數值大代表慢)
-            # 但更精確的做法是：數值越小，排名越前面
             pr_score = 100 - pr_score
         # percentage_series[col] = round(pct, 2)
         percentage_series[col] = round(pr_score, 2)
@@ -655,7 +735,7 @@ def determine_style_from_gpt_result(gpt_text):
         return "maxPunchPower"
 
 
-pygame.mixer.init()# 在全域先初始化就好
+# pygame.mixer.init()# 在全域先初始化就好1/12改
 
 def play_quick_voice(file_path):
     try:
@@ -806,8 +886,7 @@ def process_feedback_with_style_logic(current_file_path):
             
             if remaining_punches < 0:
                 # 情況 A: 已經超過目標 -> 播放 already_exceed.wav
-                # 這時候可能不需要播原本的 "你需要更多拳..."，看你需求，這裡我設為「只播 exceed」或「接在後面」
-                # 如果你想只播 exceed，就把 playlist 清空
+    
                 playlist = [] 
                 num_file = "already_exceed.wav"
                 print(f"狀況: 目標已達成 (超標 {abs(remaining_punches)})")
